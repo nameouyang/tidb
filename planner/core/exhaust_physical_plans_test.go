@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -64,7 +65,7 @@ func (s *testUnitTestSuit) TestIndexJoinAnalyzeLookUpFilters(c *C) {
 	})
 	dsSchema.Append(&expression.Column{
 		UniqueID: s.ctx.GetSessionVars().AllocPlanColumnID(),
-		RetType:  types.NewFieldType(mysql.TypeVarchar),
+		RetType:  types.NewFieldTypeWithCollation(mysql.TypeVarchar, mysql.DefaultCollationName, types.UnspecifiedLength),
 	})
 	dsNames = append(dsNames, &types.FieldName{
 		ColName: model.NewCIStr("c"),
@@ -103,7 +104,7 @@ func (s *testUnitTestSuit) TestIndexJoinAnalyzeLookUpFilters(c *C) {
 	})
 	outerChildSchema.Append(&expression.Column{
 		UniqueID: s.ctx.GetSessionVars().AllocPlanColumnID(),
-		RetType:  types.NewFieldType(mysql.TypeVarchar),
+		RetType:  types.NewFieldTypeWithCollation(mysql.TypeVarchar, mysql.DefaultCollationName, types.UnspecifiedLength),
 	})
 	outerChildNames = append(outerChildNames, &types.FieldName{
 		ColName: model.NewCIStr("g"),
@@ -120,9 +121,9 @@ func (s *testUnitTestSuit) TestIndexJoinAnalyzeLookUpFilters(c *C) {
 		DBName:  model.NewCIStr("test"),
 	})
 	joinNode.SetSchema(expression.MergeSchema(dsSchema, outerChildSchema))
-	path := &accessPath{
-		idxCols:    append(make([]*expression.Column, 0, 4), dsSchema.Columns...),
-		idxColLens: []int{types.UnspecifiedLength, types.UnspecifiedLength, 2, types.UnspecifiedLength},
+	path := &util.AccessPath{
+		IdxCols:    append(make([]*expression.Column, 0, 4), dsSchema.Columns...),
+		IdxColLens: []int{types.UnspecifiedLength, types.UnspecifiedLength, 2, types.UnspecifiedLength},
 	}
 	joinColNames := append(dsNames.Shallow(), outerChildNames...)
 
@@ -246,9 +247,9 @@ func (s *testUnitTestSuit) TestIndexJoinAnalyzeLookUpFilters(c *C) {
 		helper := &indexJoinBuildHelper{join: joinNode, lastColManager: nil}
 		_, err = helper.analyzeLookUpFilters(path, dataSourceNode, tt.innerKeys)
 		c.Assert(err, IsNil)
+		c.Assert(fmt.Sprintf("%v", helper.chosenAccess), Equals, tt.accesses)
 		c.Assert(fmt.Sprintf("%v", helper.chosenRanges), Equals, tt.ranges, Commentf("test case: #%v", i))
 		c.Assert(fmt.Sprintf("%v", helper.idxOff2KeyOff), Equals, tt.idxOff2KeyOff)
-		c.Assert(fmt.Sprintf("%v", helper.chosenAccess), Equals, tt.accesses)
 		c.Assert(fmt.Sprintf("%v", helper.chosenRemained), Equals, tt.remained)
 		c.Assert(fmt.Sprintf("%v", helper.lastColManager), Equals, tt.compareFilters)
 	}

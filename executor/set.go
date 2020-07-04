@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/expression"
@@ -28,9 +29,11 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/gcutil"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/stmtsummary"
+	"github.com/pingcap/tidb/util/stringutil"
 	"go.uber.org/zap"
 )
 
@@ -52,8 +55,15 @@ func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	sessionVars := e.ctx.GetSessionVars()
 	for _, v := range e.vars {
 		// Variable is case insensitive, we use lower case.
-		if v.Name == ast.SetNames {
+		if v.Name == ast.SetNames || v.Name == ast.SetCharset {
 			// This is set charset stmt.
+			if v.IsDefault {
+				err := e.setCharset(mysql.DefaultCharset, "", v.Name == ast.SetNames)
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			dt, err := v.Expr.(*expression.Constant).Eval(chunk.Row{})
 			if err != nil {
 				return err
@@ -63,7 +73,7 @@ func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 			if v.ExtendValue != nil {
 				co = v.ExtendValue.Value.GetString()
 			}
-			err = e.setCharset(cs, co)
+			err = e.setCharset(cs, co, v.Name == ast.SetNames)
 			if err != nil {
 				return err
 			}
@@ -84,7 +94,8 @@ func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 				if err1 != nil {
 					return err1
 				}
-				sessionVars.Users[name] = fmt.Sprintf("%v", svalue)
+
+				sessionVars.SetUserVar(name, stringutil.Copy(svalue), value.Collation())
 			}
 			continue
 		}
@@ -131,7 +142,7 @@ func (e *SetExecutor) setSysVariable(name string, v *expression.VarAssignment) e
 			return err
 		}
 		if value.IsNull() {
-			value.SetString("")
+			value.SetString("", mysql.DefaultCollationName)
 		}
 		valStr, err = value.ToString()
 		if err != nil {
@@ -163,6 +174,10 @@ func (e *SetExecutor) setSysVariable(name string, v *expression.VarAssignment) e
 		oldSnapshotTS := sessionVars.SnapshotTS
 		if name == variable.TxnIsolationOneShot && sessionVars.InTxn() {
 			return errors.Trace(ErrCantChangeTxCharacteristics)
+		}
+		if name == variable.TiDBFoundInPlanCache {
+			sessionVars.StmtCtx.AppendWarning(fmt.Errorf("Set operation for '%s' will not take effect", variable.TiDBFoundInPlanCache))
+			return nil
 		}
 		err = variable.SetSessionSystemVar(sessionVars, name, value)
 		if err != nil {
@@ -199,30 +214,67 @@ func (e *SetExecutor) setSysVariable(name string, v *expression.VarAssignment) e
 
 	switch name {
 	case variable.TiDBEnableStmtSummary:
-		stmtsummary.StmtSummaryByDigestMap.SetEnabled(valStr, !v.IsGlobal)
+		return stmtsummary.StmtSummaryByDigestMap.SetEnabled(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryInternalQuery:
+		return stmtsummary.StmtSummaryByDigestMap.SetEnabledInternalQuery(valStr, !v.IsGlobal)
 	case variable.TiDBStmtSummaryRefreshInterval:
-		stmtsummary.StmtSummaryByDigestMap.SetRefreshInterval(valStr, !v.IsGlobal)
+		return stmtsummary.StmtSummaryByDigestMap.SetRefreshInterval(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryHistorySize:
+		return stmtsummary.StmtSummaryByDigestMap.SetHistorySize(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryMaxStmtCount:
+		return stmtsummary.StmtSummaryByDigestMap.SetMaxStmtCount(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryMaxSQLLength:
+		return stmtsummary.StmtSummaryByDigestMap.SetMaxSQLLength(valStr, !v.IsGlobal)
 	case variable.TiDBCapturePlanBaseline:
-		variable.CapturePlanBaseline.Set(valStr, !v.IsGlobal)
+		variable.CapturePlanBaseline.Set(strings.ToLower(valStr), !v.IsGlobal)
 	}
 
 	return nil
 }
 
-func (e *SetExecutor) setCharset(cs, co string) error {
+func (e *SetExecutor) setCharset(cs, co string, isSetName bool) error {
 	var err error
 	if len(co) == 0 {
-		co, err = charset.GetDefaultCollation(cs)
-		if err != nil {
+		if co, err = charset.GetDefaultCollation(cs); err != nil {
 			return err
+		}
+	} else {
+		var coll *charset.Collation
+		if coll, err = collate.GetCollationByName(co); err != nil {
+			return err
+		}
+		if coll.CharsetName != cs {
+			return charset.ErrCollationCharsetMismatch.GenWithStackByArgs(coll.Name, cs)
 		}
 	}
 	sessionVars := e.ctx.GetSessionVars()
-	for _, v := range variable.SetNamesVariables {
-		terror.Log(sessionVars.SetSystemVar(v, cs))
+	if isSetName {
+		for _, v := range variable.SetNamesVariables {
+			if err = sessionVars.SetSystemVar(v, cs); err != nil {
+				return errors.Trace(err)
+			}
+		}
+		return errors.Trace(sessionVars.SetSystemVar(variable.CollationConnection, co))
 	}
-	terror.Log(sessionVars.SetSystemVar(variable.CollationConnection, co))
-	return nil
+	// Set charset statement, see also https://dev.mysql.com/doc/refman/8.0/en/set-character-set.html.
+	for _, v := range variable.SetCharsetVariables {
+		if err = sessionVars.SetSystemVar(v, cs); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	csDb, err := sessionVars.GlobalVarsAccessor.GetGlobalSysVar(variable.CharsetDatabase)
+	if err != nil {
+		return err
+	}
+	coDb, err := sessionVars.GlobalVarsAccessor.GetGlobalSysVar(variable.CollationDatabase)
+	if err != nil {
+		return err
+	}
+	err = sessionVars.SetSystemVar(variable.CharacterSetConnection, csDb)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	return errors.Trace(sessionVars.SetSystemVar(variable.CollationConnection, coDb))
 }
 
 func (e *SetExecutor) getVarValue(v *expression.VarAssignment, sysVar *variable.SysVar) (value types.Datum, err error) {

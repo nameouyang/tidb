@@ -33,6 +33,7 @@ type SQLBindExec struct {
 	bindSQL      string
 	charset      string
 	collation    string
+	db           string
 	isGlobal     bool
 	bindAst      ast.StmtNode
 }
@@ -51,6 +52,8 @@ func (e *SQLBindExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		e.captureBindings()
 	case plannercore.OpEvolveBindings:
 		return e.evolveBindings()
+	case plannercore.OpReloadBindings:
+		return e.reloadBindings()
 	default:
 		return errors.Errorf("unsupported SQL bind operation: %v", e.sqlBindOp)
 	}
@@ -58,23 +61,19 @@ func (e *SQLBindExec) Next(ctx context.Context, req *chunk.Chunk) error {
 }
 
 func (e *SQLBindExec) dropSQLBind() error {
-	record := &bindinfo.BindRecord{
-		OriginalSQL: e.normdOrigSQL,
-		Db:          e.ctx.GetSessionVars().CurrentDB,
-	}
+	var bindInfo *bindinfo.Binding
 	if e.bindSQL != "" {
-		bindInfo := bindinfo.Binding{
+		bindInfo = &bindinfo.Binding{
 			BindSQL:   e.bindSQL,
 			Charset:   e.charset,
 			Collation: e.collation,
 		}
-		record.Bindings = append(record.Bindings, bindInfo)
 	}
 	if !e.isGlobal {
 		handle := e.ctx.Value(bindinfo.SessionBindInfoKeyType).(*bindinfo.SessionHandle)
-		return handle.DropBindRecord(e.ctx, GetInfoSchema(e.ctx), record)
+		return handle.DropBindRecord(e.normdOrigSQL, e.db, bindInfo)
 	}
-	return domain.GetDomain(e.ctx).BindHandle().DropBindRecord(e.ctx, GetInfoSchema(e.ctx), record)
+	return domain.GetDomain(e.ctx).BindHandle().DropBindRecord(e.normdOrigSQL, e.db, bindInfo)
 }
 
 func (e *SQLBindExec) createSQLBind() error {
@@ -83,24 +82,22 @@ func (e *SQLBindExec) createSQLBind() error {
 		Charset:   e.charset,
 		Collation: e.collation,
 		Status:    bindinfo.Using,
+		Source:    bindinfo.Manual,
 	}
 	record := &bindinfo.BindRecord{
 		OriginalSQL: e.normdOrigSQL,
-		Db:          e.ctx.GetSessionVars().CurrentDB,
+		Db:          e.db,
 		Bindings:    []bindinfo.Binding{bindInfo},
 	}
 	if !e.isGlobal {
 		handle := e.ctx.Value(bindinfo.SessionBindInfoKeyType).(*bindinfo.SessionHandle)
-		return handle.AddBindRecord(e.ctx, GetInfoSchema(e.ctx), record)
+		return handle.CreateBindRecord(e.ctx, record)
 	}
-	return domain.GetDomain(e.ctx).BindHandle().AddBindRecord(e.ctx, GetInfoSchema(e.ctx), record)
+	return domain.GetDomain(e.ctx).BindHandle().CreateBindRecord(e.ctx, record)
 }
 
 func (e *SQLBindExec) flushBindings() error {
-	handle := domain.GetDomain(e.ctx).BindHandle()
-	handle.DropInvalidBindRecord()
-	handle.SaveEvolveTasksToStore()
-	return handle.Update(false)
+	return domain.GetDomain(e.ctx).BindHandle().FlushBindings()
 }
 
 func (e *SQLBindExec) captureBindings() {
@@ -108,5 +105,9 @@ func (e *SQLBindExec) captureBindings() {
 }
 
 func (e *SQLBindExec) evolveBindings() error {
-	return domain.GetDomain(e.ctx).BindHandle().HandleEvolvePlanTask(e.ctx)
+	return domain.GetDomain(e.ctx).BindHandle().HandleEvolvePlanTask(e.ctx, true)
+}
+
+func (e *SQLBindExec) reloadBindings() error {
+	return domain.GetDomain(e.ctx).BindHandle().ReloadBindings()
 }

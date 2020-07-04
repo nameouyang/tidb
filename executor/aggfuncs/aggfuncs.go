@@ -32,7 +32,18 @@ var (
 	_ AggFunc = (*countOriginal4Duration)(nil)
 	_ AggFunc = (*countOriginal4JSON)(nil)
 	_ AggFunc = (*countOriginal4String)(nil)
+	_ AggFunc = (*countOriginalWithDistinct4Int)(nil)
+	_ AggFunc = (*countOriginalWithDistinct4Real)(nil)
+	_ AggFunc = (*countOriginalWithDistinct4Decimal)(nil)
+	_ AggFunc = (*countOriginalWithDistinct4Duration)(nil)
+	_ AggFunc = (*countOriginalWithDistinct4String)(nil)
 	_ AggFunc = (*countOriginalWithDistinct)(nil)
+
+	// All the AggFunc implementations for "APPROX_COUNT_DISTINCT" are listed here.
+	_ AggFunc = (*approxCountDistinctOriginal)(nil)
+	_ AggFunc = (*approxCountDistinctPartial1)(nil)
+	_ AggFunc = (*approxCountDistinctPartial2)(nil)
+	_ AggFunc = (*approxCountDistinctFinal)(nil)
 
 	// All the AggFunc implementations for "FIRSTROW" are listed here.
 	_ AggFunc = (*firstRow4Decimal)(nil)
@@ -43,6 +54,8 @@ var (
 	_ AggFunc = (*firstRow4Float32)(nil)
 	_ AggFunc = (*firstRow4Float64)(nil)
 	_ AggFunc = (*firstRow4JSON)(nil)
+	_ AggFunc = (*firstRow4Enum)(nil)
+	_ AggFunc = (*firstRow4Set)(nil)
 
 	// All the AggFunc implementations for "MAX"/"MIN" are listed here.
 	_ AggFunc = (*maxMin4Int)(nil)
@@ -81,6 +94,9 @@ var (
 
 	// All the AggFunc implementations for "BIT_AND" are listed here.
 	_ AggFunc = (*bitAndUint64)(nil)
+
+	// All the AggFunc implementations for "JSON_OBJECTAGG" are listed here
+	_ AggFunc = (*jsonObjectAgg)(nil)
 )
 
 // PartialResult represents data structure to store the partial result for the
@@ -137,4 +153,15 @@ type baseAggFunc struct {
 
 func (*baseAggFunc) MergePartialResult(sctx sessionctx.Context, src, dst PartialResult) error {
 	return nil
+}
+
+// SlidingWindowAggFunc is the interface to evaluate the aggregate functions using sliding window.
+type SlidingWindowAggFunc interface {
+	// Slide evaluates the aggregate functions using a sliding window. The input
+	// lastStart and lastEnd are the interval of the former sliding window,
+	// shiftStart, shiftEnd mean the sliding window offset. Note that the input
+	// PartialResult stores the intermediate result which will be used in the next
+	// sliding window, ensure call ResetPartialResult after a frame are evaluated
+	// completely.
+	Slide(sctx sessionctx.Context, rows []chunk.Row, lastStart, lastEnd uint64, shiftStart, shiftEnd uint64, pr PartialResult) error
 }

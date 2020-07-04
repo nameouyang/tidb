@@ -88,7 +88,7 @@ const checkScatterRegionFinishBackOff = 50
 // splitIndexRegion is used to split index regions.
 func (e *SplitIndexRegionExec) splitIndexRegion(ctx context.Context) error {
 	store := e.ctx.GetStore()
-	s, ok := store.(kv.SplitableStore)
+	s, ok := store.(kv.SplittableStore)
 	if !ok {
 		return nil
 	}
@@ -96,7 +96,7 @@ func (e *SplitIndexRegionExec) splitIndexRegion(ctx context.Context) error {
 	start := time.Now()
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, e.ctx.GetSessionVars().GetSplitRegionTimeout())
 	defer cancel()
-	regionIDs, err := s.SplitRegions(context.Background(), e.splitIdxKeys, true)
+	regionIDs, err := s.SplitRegions(ctxWithTimeout, e.splitIdxKeys, true)
 	if err != nil {
 		logutil.BgLogger().Warn("split table index region failed",
 			zap.String("table", e.tableInfo.Name.L),
@@ -162,7 +162,7 @@ func (e *SplitIndexRegionExec) getSplitIdxPhysicalKeysFromValueList(physicalID i
 	keys = e.getSplitIdxPhysicalStartAndOtherIdxKeys(physicalID, keys)
 	index := tables.NewIndex(physicalID, e.tableInfo, e.indexInfo)
 	for _, v := range e.valueLists {
-		idxKey, _, err := index.GenIndexKey(e.ctx.GetSessionVars().StmtCtx, v, math.MinInt64, nil)
+		idxKey, _, err := index.GenIndexKey(e.ctx.GetSessionVars().StmtCtx, v, kv.IntHandle(math.MinInt64), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -172,19 +172,16 @@ func (e *SplitIndexRegionExec) getSplitIdxPhysicalKeysFromValueList(physicalID i
 }
 
 func (e *SplitIndexRegionExec) getSplitIdxPhysicalStartAndOtherIdxKeys(physicalID int64, keys [][]byte) [][]byte {
-	// Split in the start of the index key.
-	startIdxKey := tablecodec.EncodeTableIndexPrefix(physicalID, e.indexInfo.ID)
-	keys = append(keys, startIdxKey)
-
-	// Split in the end for the other index key.
-	for _, idx := range e.tableInfo.Indices {
-		if idx.ID <= e.indexInfo.ID {
-			continue
-		}
-		endIdxKey := tablecodec.EncodeTableIndexPrefix(physicalID, idx.ID)
-		keys = append(keys, endIdxKey)
-		break
+	// 1. Split in the start key for the index if the index is not the first index.
+	// For the first index, split the start key is useless.
+	if len(e.tableInfo.Indices) > 0 && e.tableInfo.Indices[0].ID != e.indexInfo.ID {
+		startKey := tablecodec.EncodeTableIndexPrefix(physicalID, e.indexInfo.ID)
+		keys = append(keys, startKey)
 	}
+
+	// 2. Split in the end key.
+	endKey := tablecodec.EncodeTableIndexPrefix(physicalID, e.indexInfo.ID+1)
+	keys = append(keys, endKey)
 	return keys
 }
 
@@ -226,13 +223,13 @@ func (e *SplitIndexRegionExec) getSplitIdxPhysicalKeysFromBound(physicalID int64
 	keys = e.getSplitIdxPhysicalStartAndOtherIdxKeys(physicalID, keys)
 	index := tables.NewIndex(physicalID, e.tableInfo, e.indexInfo)
 	// Split index regions by lower, upper value and calculate the step by (upper - lower)/num.
-	lowerIdxKey, _, err := index.GenIndexKey(e.ctx.GetSessionVars().StmtCtx, e.lower, math.MinInt64, nil)
+	lowerIdxKey, _, err := index.GenIndexKey(e.ctx.GetSessionVars().StmtCtx, e.lower, kv.IntHandle(math.MinInt64), nil)
 	if err != nil {
 		return nil, err
 	}
 	// Use math.MinInt64 as handle_id for the upper index key to avoid affecting calculate split point.
 	// If use math.MaxInt64 here, test of `TestSplitIndex` will report error.
-	upperIdxKey, _, err := index.GenIndexKey(e.ctx.GetSessionVars().StmtCtx, e.upper, math.MinInt64, nil)
+	upperIdxKey, _, err := index.GenIndexKey(e.ctx.GetSessionVars().StmtCtx, e.upper, kv.IntHandle(math.MinInt64), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +356,7 @@ func (e *SplitTableRegionExec) Next(ctx context.Context, chk *chunk.Chunk) error
 
 func (e *SplitTableRegionExec) splitTableRegion(ctx context.Context) error {
 	store := e.ctx.GetStore()
-	s, ok := store.(kv.SplitableStore)
+	s, ok := store.(kv.SplittableStore)
 	if !ok {
 		return nil
 	}
@@ -387,7 +384,7 @@ func (e *SplitTableRegionExec) splitTableRegion(ctx context.Context) error {
 	return nil
 }
 
-func waitScatterRegionFinish(ctxWithTimeout context.Context, sctx sessionctx.Context, startTime time.Time, store kv.SplitableStore, regionIDs []uint64, tableName, indexName string) int {
+func waitScatterRegionFinish(ctxWithTimeout context.Context, sctx sessionctx.Context, startTime time.Time, store kv.SplittableStore, regionIDs []uint64, tableName, indexName string) int {
 	remainMillisecond := 0
 	finishScatterNum := 0
 	for _, regionID := range regionIDs {
@@ -401,7 +398,7 @@ func waitScatterRegionFinish(ctxWithTimeout context.Context, sctx sessionctx.Con
 			remainMillisecond = int((sctx.GetSessionVars().GetSplitRegionTimeout().Seconds() - time.Since(startTime).Seconds()) * 1000)
 		}
 
-		err := store.WaitScatterRegionFinish(regionID, remainMillisecond)
+		err := store.WaitScatterRegionFinish(ctxWithTimeout, regionID, remainMillisecond)
 		if err == nil {
 			finishScatterNum++
 		} else {
@@ -482,7 +479,7 @@ func (e *SplitTableRegionExec) getSplitTableKeysFromValueList() ([][]byte, error
 func (e *SplitTableRegionExec) getSplitTablePhysicalKeysFromValueList(physicalID int64, keys [][]byte) [][]byte {
 	recordPrefix := tablecodec.GenTableRecordPrefix(physicalID)
 	for _, v := range e.valueLists {
-		key := tablecodec.EncodeRecordKey(recordPrefix, v[0].GetInt64())
+		key := tablecodec.EncodeRecordKey(recordPrefix, kv.IntHandle(v[0].GetInt64()))
 		keys = append(keys, key)
 	}
 	return keys
@@ -534,7 +531,7 @@ func (e *SplitTableRegionExec) calculateBoundValue() (lowerValue int64, step int
 		if upperRecordID <= lowerRecordID {
 			return 0, 0, errors.Errorf("Split table `%s` region lower value %v should less than the upper value %v", e.tableInfo.Name, lowerRecordID, upperRecordID)
 		}
-		step = int64(uint64(upperRecordID-lowerRecordID) / uint64(e.num))
+		step = int64((upperRecordID - lowerRecordID) / uint64(e.num))
 		lowerValue = int64(lowerRecordID)
 	} else {
 		lowerRecordID := e.lower.GetInt64()
@@ -560,7 +557,7 @@ func (e *SplitTableRegionExec) getSplitTablePhysicalKeysFromBound(physicalID, lo
 	recordID := low
 	for i := 1; i < e.num; i++ {
 		recordID += step
-		key := tablecodec.EncodeRecordKey(recordPrefix, recordID)
+		key := tablecodec.EncodeRecordKey(recordPrefix, kv.IntHandle(recordID))
 		keys = append(keys, key)
 	}
 	return keys
@@ -580,7 +577,7 @@ type regionMeta struct {
 	approximateKeys int64
 }
 
-func getPhysicalTableRegions(physicalTableID int64, tableInfo *model.TableInfo, tikvStore tikv.Storage, s kv.SplitableStore, uniqueRegionMap map[uint64]struct{}) ([]regionMeta, error) {
+func getPhysicalTableRegions(physicalTableID int64, tableInfo *model.TableInfo, tikvStore tikv.Storage, s kv.SplittableStore, uniqueRegionMap map[uint64]struct{}) ([]regionMeta, error) {
 	if uniqueRegionMap == nil {
 		uniqueRegionMap = make(map[uint64]struct{})
 	}
@@ -623,7 +620,7 @@ func getPhysicalTableRegions(physicalTableID int64, tableInfo *model.TableInfo, 
 	return regions, nil
 }
 
-func getPhysicalIndexRegions(physicalTableID int64, indexInfo *model.IndexInfo, tikvStore tikv.Storage, s kv.SplitableStore, uniqueRegionMap map[uint64]struct{}) ([]regionMeta, error) {
+func getPhysicalIndexRegions(physicalTableID int64, indexInfo *model.IndexInfo, tikvStore tikv.Storage, s kv.SplittableStore, uniqueRegionMap map[uint64]struct{}) ([]regionMeta, error) {
 	if uniqueRegionMap == nil {
 		uniqueRegionMap = make(map[uint64]struct{})
 	}
@@ -648,7 +645,7 @@ func getPhysicalIndexRegions(physicalTableID int64, indexInfo *model.IndexInfo, 
 	return indexRegions, nil
 }
 
-func checkRegionsStatus(store kv.SplitableStore, regions []regionMeta) error {
+func checkRegionsStatus(store kv.SplittableStore, regions []regionMeta) error {
 	for i := range regions {
 		scattering, err := store.CheckRegionInScattering(regions[i].region.Id)
 		if err != nil {
@@ -727,7 +724,7 @@ func getRegionMeta(tikvStore tikv.Storage, regionMetas []*tikv.Region, uniqueReg
 		uniqueRegionMap[r.GetID()] = struct{}{}
 		regions = append(regions, regionMeta{
 			region:   r.GetMeta(),
-			leaderID: r.GetLeaderID(),
+			leaderID: r.GetLeaderPeerID(),
 			storeID:  r.GetLeaderStoreID(),
 		})
 	}

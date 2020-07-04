@@ -16,8 +16,8 @@ package tikv
 import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	mysql "github.com/pingcap/tidb/errno"
 )
 
 var (
@@ -37,11 +37,21 @@ var (
 	ErrPDServerTimeout             = terror.ClassTiKV.New(mysql.ErrPDServerTimeout, mysql.MySQLErrName[mysql.ErrPDServerTimeout])
 	ErrRegionUnavailable           = terror.ClassTiKV.New(mysql.ErrRegionUnavailable, mysql.MySQLErrName[mysql.ErrRegionUnavailable])
 	ErrTiKVServerBusy              = terror.ClassTiKV.New(mysql.ErrTiKVServerBusy, mysql.MySQLErrName[mysql.ErrTiKVServerBusy])
+	ErrTiKVStaleCommand            = terror.ClassTiKV.New(mysql.ErrTiKVStaleCommand, mysql.MySQLErrName[mysql.ErrTiKVStaleCommand])
 	ErrGCTooEarly                  = terror.ClassTiKV.New(mysql.ErrGCTooEarly, mysql.MySQLErrName[mysql.ErrGCTooEarly])
 	ErrQueryInterrupted            = terror.ClassTiKV.New(mysql.ErrQueryInterrupted, mysql.MySQLErrName[mysql.ErrQueryInterrupted])
 	ErrLockAcquireFailAndNoWaitSet = terror.ClassTiKV.New(mysql.ErrLockAcquireFailAndNoWaitSet, mysql.MySQLErrName[mysql.ErrLockAcquireFailAndNoWaitSet])
 	ErrLockWaitTimeout             = terror.ClassTiKV.New(mysql.ErrLockWaitTimeout, mysql.MySQLErrName[mysql.ErrLockWaitTimeout])
 	ErrTokenLimit                  = terror.ClassTiKV.New(mysql.ErrTiKVStoreLimit, mysql.MySQLErrName[mysql.ErrTiKVStoreLimit])
+	ErrLockExpire                  = terror.ClassTiKV.New(mysql.ErrLockExpire, mysql.MySQLErrName[mysql.ErrLockExpire])
+	ErrUnknown                     = terror.ClassTiKV.New(mysql.ErrUnknown, mysql.MySQLErrName[mysql.ErrUnknown])
+)
+
+// Registers error returned from TiKV.
+var (
+	_ = terror.ClassTiKV.NewStd(mysql.ErrDataOutOfRange)
+	_ = terror.ClassTiKV.NewStd(mysql.ErrTruncatedWrongValue)
+	_ = terror.ClassTiKV.NewStd(mysql.ErrDivisionByZero)
 )
 
 // ErrDeadlock wraps *kvrpcpb.Deadlock to implement the error interface.
@@ -53,21 +63,4 @@ type ErrDeadlock struct {
 
 func (d *ErrDeadlock) Error() string {
 	return d.Deadlock.String()
-}
-
-func init() {
-	tikvMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrTiKVServerTimeout:           mysql.ErrTiKVServerTimeout,
-		mysql.ErrResolveLockTimeout:          mysql.ErrResolveLockTimeout,
-		mysql.ErrPDServerTimeout:             mysql.ErrPDServerTimeout,
-		mysql.ErrRegionUnavailable:           mysql.ErrRegionUnavailable,
-		mysql.ErrTiKVServerBusy:              mysql.ErrTiKVServerBusy,
-		mysql.ErrGCTooEarly:                  mysql.ErrGCTooEarly,
-		mysql.ErrTruncatedWrongValue:         mysql.ErrTruncatedWrongValue,
-		mysql.ErrQueryInterrupted:            mysql.ErrQueryInterrupted,
-		mysql.ErrLockAcquireFailAndNoWaitSet: mysql.ErrLockAcquireFailAndNoWaitSet,
-		mysql.ErrDataOutOfRange:              mysql.ErrDataOutOfRange,
-		mysql.ErrLockWaitTimeout:             mysql.ErrLockWaitTimeout,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassTiKV] = tikvMySQLErrCodes
 }

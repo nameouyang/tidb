@@ -20,7 +20,9 @@ import (
 	"github.com/pingcap/tidb/expression/aggregation"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tipb/go-tipb"
@@ -35,8 +37,12 @@ func (p *basePhysicalPlan) ToPB(_ sessionctx.Context) (*tipb.Executor, error) {
 func (p *PhysicalHashAgg) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 	sc := ctx.GetSessionVars().StmtCtx
 	client := ctx.GetClient()
+	groupByExprs, err := expression.ExpressionsToPBList(sc, p.GroupByItems, client)
+	if err != nil {
+		return nil, err
+	}
 	aggExec := &tipb.Aggregation{
-		GroupBy: expression.ExpressionsToPBList(sc, p.GroupByItems, client),
+		GroupBy: groupByExprs,
 	}
 	for _, aggFunc := range p.AggFuncs {
 		aggExec.AggFunc = append(aggExec.AggFunc, aggregation.AggFuncToPBExpr(sc, client, aggFunc))
@@ -48,8 +54,12 @@ func (p *PhysicalHashAgg) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 func (p *PhysicalStreamAgg) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 	sc := ctx.GetSessionVars().StmtCtx
 	client := ctx.GetClient()
+	groupByExprs, err := expression.ExpressionsToPBList(sc, p.GroupByItems, client)
+	if err != nil {
+		return nil, err
+	}
 	aggExec := &tipb.Aggregation{
-		GroupBy: expression.ExpressionsToPBList(sc, p.GroupByItems, client),
+		GroupBy: groupByExprs,
 	}
 	for _, aggFunc := range p.AggFuncs {
 		aggExec.AggFunc = append(aggExec.AggFunc, aggregation.AggFuncToPBExpr(sc, client, aggFunc))
@@ -61,8 +71,12 @@ func (p *PhysicalStreamAgg) ToPB(ctx sessionctx.Context) (*tipb.Executor, error)
 func (p *PhysicalSelection) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 	sc := ctx.GetSessionVars().StmtCtx
 	client := ctx.GetClient()
+	conditions, err := expression.ExpressionsToPBList(sc, p.Conditions, client)
+	if err != nil {
+		return nil, err
+	}
 	selExec := &tipb.Selection{
-		Conditions: expression.ExpressionsToPBList(sc, p.Conditions, client),
+		Conditions: conditions,
 	}
 	return &tipb.Executor{Tp: tipb.ExecType_TypeSelection, Selection: selExec}, nil
 }
@@ -90,11 +104,10 @@ func (p *PhysicalLimit) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 
 // ToPB implements PhysicalPlan ToPB interface.
 func (p *PhysicalTableScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
-	columns := p.Columns
-	tsExec := &tipb.TableScan{
-		TableId: p.Table.ID,
-		Columns: model.ColumnsToProto(columns, p.Table.PKIsHandle),
-		Desc:    p.Desc,
+	tsExec := tables.BuildTableScanFromInfos(p.Table, p.Columns)
+	tsExec.Desc = p.Desc
+	if p.isPartition {
+		tsExec.TableId = p.physicalTableID
 	}
 	err := SetPBColumnsDefaultValue(ctx, tsExec.Columns, p.Columns)
 	return &tipb.Executor{Tp: tipb.ExecType_TypeTableScan, TblScan: tsExec}, err
@@ -135,11 +148,19 @@ func (p *PhysicalIndexScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error)
 			columns = append(columns, findColumnInfoByID(tableColumns, col.ID))
 		}
 	}
+	var pkColIds []int64
+	if p.NeedCommonHandle {
+		pkColIds = tables.TryGetCommonPkColumnIds(p.Table)
+	}
 	idxExec := &tipb.IndexScan{
-		TableId: p.Table.ID,
-		IndexId: p.Index.ID,
-		Columns: model.ColumnsToProto(columns, p.Table.PKIsHandle),
-		Desc:    p.Desc,
+		TableId:          p.Table.ID,
+		IndexId:          p.Index.ID,
+		Columns:          util.ColumnsToProto(columns, p.Table.PKIsHandle),
+		Desc:             p.Desc,
+		PrimaryColumnIds: pkColIds,
+	}
+	if p.isPartition {
+		idxExec.TableId = p.physicalTableID
 	}
 	unique := checkCoverIndex(p.Index, p.Ranges)
 	idxExec.Unique = &unique
@@ -181,7 +202,7 @@ func SetPBColumnsDefaultValue(ctx sessionctx.Context, pbColumns []*tipb.ColumnIn
 // TODO: Support more kinds of physical plan.
 func SupportStreaming(p PhysicalPlan) bool {
 	switch p.(type) {
-	case *PhysicalTableScan, *PhysicalIndexScan, *PhysicalSelection:
+	case *PhysicalIndexScan, *PhysicalSelection, *PhysicalTableScan:
 		return true
 	}
 	return false

@@ -19,6 +19,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/stringutil"
 )
 
@@ -78,12 +79,46 @@ func (b *builtinValuesJSONSig) vecEvalJSON(input *chunk.Chunk, result *chunk.Col
 	return errors.Errorf("not implemented")
 }
 
-func (b *builtinBitCountSig) vectorized() bool {
-	return false
+// bitCount returns the number of bits that are set in the argument 'value'.
+func bitCount(value int64) int64 {
+	value = value - ((value >> 1) & 0x5555555555555555)
+	value = (value & 0x3333333333333333) + ((value >> 2) & 0x3333333333333333)
+	value = (value & 0x0f0f0f0f0f0f0f0f) + ((value >> 4) & 0x0f0f0f0f0f0f0f0f)
+	value = value + (value >> 8)
+	value = value + (value >> 16)
+	value = value + (value >> 32)
+	value = value & 0x7f
+	return value
 }
-
+func (b *builtinBitCountSig) vectorized() bool {
+	return true
+}
 func (b *builtinBitCountSig) vecEvalInt(input *chunk.Chunk, result *chunk.Column) error {
-	return errors.Errorf("not implemented")
+	n := input.NumRows()
+	if err := b.args[0].VecEvalInt(b.ctx, input, result); err != nil {
+		if types.ErrOverflow.Equal(err) {
+			result.ResizeInt64(n, false)
+			i64s := result.Int64s()
+			for i := 0; i < n; i++ {
+				res, isNull, err := b.evalInt(input.GetRow(i))
+				if err != nil {
+					return err
+				}
+				result.SetNull(i, isNull)
+				i64s[i] = res
+			}
+			return nil
+		}
+		return err
+	}
+	i64s := result.Int64s()
+	for i := 0; i < n; i++ {
+		if result.IsNull(i) {
+			continue
+		}
+		i64s[i] = bitCount(i64s[i])
+	}
+	return nil
 }
 
 func (b *builtinGetParamStringSig) vectorized() bool {
@@ -146,6 +181,7 @@ func (b *builtinSetVarSig) vecEvalString(input *chunk.Chunk, result *chunk.Colum
 	sessionVars := b.ctx.GetSessionVars()
 	sessionVars.UsersLock.Lock()
 	defer sessionVars.UsersLock.Unlock()
+	_, collation := sessionVars.GetCharsetInfo()
 	for i := 0; i < n; i++ {
 		if buf0.IsNull(i) || buf1.IsNull(i) {
 			result.AppendNull()
@@ -153,7 +189,7 @@ func (b *builtinSetVarSig) vecEvalString(input *chunk.Chunk, result *chunk.Colum
 		}
 		varName := strings.ToLower(buf0.GetString(i))
 		res := buf1.GetString(i)
-		sessionVars.Users[varName] = stringutil.Copy(res)
+		sessionVars.Users[varName] = types.NewCollationStringDatum(stringutil.Copy(res), collation, collate.DefaultLen)
 		result.AppendString(res)
 	}
 	return nil
@@ -192,7 +228,7 @@ func (b *builtinGetVarSig) vecEvalString(input *chunk.Chunk, result *chunk.Colum
 		}
 		varName := strings.ToLower(buf0.GetString(i))
 		if v, ok := sessionVars.Users[varName]; ok {
-			result.AppendString(v)
+			result.AppendString(v.GetString())
 			continue
 		}
 		result.AppendNull()

@@ -10,6 +10,7 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// +build !windows
 
 package util_test
 
@@ -32,8 +33,8 @@ import (
 	"go.etcd.io/etcd/integration"
 	"go.etcd.io/etcd/mvcc/mvccpb"
 	goctx "golang.org/x/net/context"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestT(t *testing.T) {
@@ -50,7 +51,7 @@ func TestSyncerSimple(t *testing.T) {
 		CheckVersFirstWaitTime = origin
 	}()
 
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +67,10 @@ func TestSyncerSimple(t *testing.T) {
 		WithStore(store),
 		WithLease(testLease),
 	)
+	err = d.Start(nil)
+	if err != nil {
+		t.Fatalf("DDL start failed %v", err)
+	}
 	defer d.Stop()
 
 	// for init function
@@ -98,6 +103,10 @@ func TestSyncerSimple(t *testing.T) {
 		WithStore(store),
 		WithLease(testLease),
 	)
+	err = d1.Start(nil)
+	if err != nil {
+		t.Fatalf("DDL start failed %v", err)
+	}
 	defer d1.Stop()
 	if err = d1.SchemaSyncer().Init(ctx); err != nil {
 		t.Fatalf("schema version syncer init failed %v", err)
@@ -115,7 +124,7 @@ func TestSyncerSimple(t *testing.T) {
 				t.Fatalf("get chan events count less than 1")
 			}
 			checkRespKV(t, 1, DDLGlobalSchemaVersion, fmt.Sprintf("%v", currentVer), resp.Events[0].Kv)
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(3 * time.Second):
 			t.Fatalf("get udpate version failed")
 		}
 	}()
@@ -230,7 +239,7 @@ func TestSyncerSimple(t *testing.T) {
 }
 
 func isTimeoutError(err error) bool {
-	if terror.ErrorEqual(err, goctx.DeadlineExceeded) || grpc.Code(errors.Cause(err)) == codes.DeadlineExceeded ||
+	if terror.ErrorEqual(err, goctx.DeadlineExceeded) || status.Code(errors.Cause(err)) == codes.DeadlineExceeded ||
 		terror.ErrorEqual(err, etcdserver.ErrTimeout) {
 		return true
 	}
@@ -250,7 +259,7 @@ func checkRespKV(t *testing.T, kvCount int, key, val string,
 	if string(kv.Key) != key {
 		t.Fatalf("key resp %s, exported %s", kv.Key, key)
 	}
-	if val != val {
+	if string(kv.Value) != val {
 		t.Fatalf("val resp %s, exported %s", kv.Value, val)
 	}
 }

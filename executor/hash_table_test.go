@@ -111,22 +111,30 @@ func (h hashCollision) Sum(b []byte) []byte               { panic("not implement
 func (h hashCollision) Size() int                         { panic("not implemented") }
 func (h hashCollision) BlockSize() int                    { panic("not implemented") }
 
-func (s *pkgTestSuite) TestHashRowContainer(c *C) {
+func (s *pkgTestSerialSuite) TestHashRowContainer(c *C) {
 	hashFunc := func() hash.Hash64 {
 		return fnv.New64()
 	}
-	s.testHashRowContainer(c, hashFunc, false)
-	s.testHashRowContainer(c, hashFunc, true)
+	rowContainer := s.testHashRowContainer(c, hashFunc, false)
+	c.Assert(rowContainer.stat.probeCollision, Equals, 0)
+	// On windows time.Now() is imprecise, the elapse time may equal 0
+	c.Assert(rowContainer.stat.buildTableElapse >= 0, IsTrue)
+
+	rowContainer = s.testHashRowContainer(c, hashFunc, true)
+	c.Assert(rowContainer.stat.probeCollision, Equals, 0)
+	c.Assert(rowContainer.stat.buildTableElapse >= 0, IsTrue)
 
 	h := &hashCollision{count: 0}
 	hashFuncCollision := func() hash.Hash64 {
 		return h
 	}
-	s.testHashRowContainer(c, hashFuncCollision, false)
+	rowContainer = s.testHashRowContainer(c, hashFuncCollision, false)
 	c.Assert(h.count > 0, IsTrue)
+	c.Assert(rowContainer.stat.probeCollision > 0, IsTrue)
+	c.Assert(rowContainer.stat.buildTableElapse >= 0, IsTrue)
 }
 
-func (s *pkgTestSuite) testHashRowContainer(c *C, hashFunc func() hash.Hash64, spill bool) {
+func (s *pkgTestSerialSuite) testHashRowContainer(c *C, hashFunc func() hash.Hash64, spill bool) *hashRowContainer {
 	sctx := mock.NewContext()
 	var err error
 	numRows := 10
@@ -146,19 +154,18 @@ func (s *pkgTestSuite) testHashRowContainer(c *C, hashFunc func() hash.Hash64, s
 	tracker := rowContainer.GetMemTracker()
 	tracker.SetLabel(buildSideResultLabel)
 	if spill {
-		rowContainer.ActionSpill().Action(tracker)
 		tracker.SetBytesLimit(1)
+		rowContainer.rowContainer.ActionSpillForTest().Action(tracker)
 	}
 	err = rowContainer.PutChunk(chk0)
 	c.Assert(err, IsNil)
 	err = rowContainer.PutChunk(chk1)
 	c.Assert(err, IsNil)
-
-	c.Assert(rowContainer.alreadySpilled(), Equals, spill)
+	rowContainer.ActionSpill().(*chunk.SpillDiskAction).WaitForTest()
 	c.Assert(rowContainer.alreadySpilledSafe(), Equals, spill)
 	c.Assert(rowContainer.GetMemTracker().BytesConsumed() == 0, Equals, spill)
 	c.Assert(rowContainer.GetMemTracker().BytesConsumed() > 0, Equals, !spill)
-	if rowContainer.alreadySpilled() {
+	if rowContainer.alreadySpilledSafe() {
 		c.Assert(rowContainer.GetDiskTracker(), NotNil)
 		c.Assert(rowContainer.GetDiskTracker().BytesConsumed() > 0, Equals, true)
 	}
@@ -176,4 +183,5 @@ func (s *pkgTestSuite) testHashRowContainer(c *C, hashFunc func() hash.Hash64, s
 	c.Assert(len(matched), Equals, 2)
 	c.Assert(matched[0].GetDatumRow(colTypes), DeepEquals, chk0.GetRow(1).GetDatumRow(colTypes))
 	c.Assert(matched[1].GetDatumRow(colTypes), DeepEquals, chk1.GetRow(1).GetDatumRow(colTypes))
+	return rowContainer
 }

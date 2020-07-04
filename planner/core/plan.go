@@ -18,8 +18,11 @@ import (
 	"math"
 	"strconv"
 
+	"github.com/cznic/mathutil"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/planner/property"
+	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/stringutil"
@@ -68,17 +71,77 @@ func enforceProperty(p *property.PhysicalProperty, tsk task, ctx sessionctx.Cont
 	}
 	tsk = finishCopTask(ctx, tsk)
 	sortReqProp := &property.PhysicalProperty{TaskTp: property.RootTaskType, Items: p.Items, ExpectedCnt: math.MaxFloat64}
-	sort := PhysicalSort{ByItems: make([]*ByItems, 0, len(p.Items))}.Init(ctx, tsk.plan().statsInfo(), tsk.plan().SelectBlockOffset(), sortReqProp)
+	sort := PhysicalSort{ByItems: make([]*util.ByItems, 0, len(p.Items))}.Init(ctx, tsk.plan().statsInfo(), tsk.plan().SelectBlockOffset(), sortReqProp)
 	for _, col := range p.Items {
-		sort.ByItems = append(sort.ByItems, &ByItems{col.Col, col.Desc})
+		sort.ByItems = append(sort.ByItems, &util.ByItems{Expr: col.Col, Desc: col.Desc})
 	}
 	return sort.attach2Task(tsk)
+}
+
+// optimizeByShuffle insert `PhysicalShuffle` to optimize performance by running in a parallel manner.
+func optimizeByShuffle(pp PhysicalPlan, tsk task, ctx sessionctx.Context) task {
+	if tsk.plan() == nil {
+		return tsk
+	}
+
+	// Don't use `tsk.plan()` here, which will probably be different from `pp`.
+	// Eg., when `pp` is `NominalSort`, `tsk.plan()` would be its child.
+	switch p := pp.(type) {
+	case *PhysicalWindow:
+		if shuffle := optimizeByShuffle4Window(p, ctx); shuffle != nil {
+			return shuffle.attach2Task(tsk)
+		}
+	}
+	return tsk
+}
+
+func optimizeByShuffle4Window(pp *PhysicalWindow, ctx sessionctx.Context) *PhysicalShuffle {
+	concurrency := ctx.GetSessionVars().WindowConcurrency()
+	if concurrency <= 1 {
+		return nil
+	}
+
+	sort, ok := pp.Children()[0].(*PhysicalSort)
+	if !ok {
+		// Multi-thread executing on SORTED data source is not effective enough by current implementation.
+		// TODO: Implement a better one.
+		return nil
+	}
+	tail, dataSource := sort, sort.Children()[0]
+
+	partitionBy := make([]*expression.Column, 0, len(pp.PartitionBy))
+	for _, item := range pp.PartitionBy {
+		partitionBy = append(partitionBy, item.Col)
+	}
+	NDV := int(getCardinality(partitionBy, dataSource.Schema(), dataSource.statsInfo()))
+	if NDV <= 1 {
+		return nil
+	}
+	concurrency = mathutil.Min(concurrency, NDV)
+
+	byItems := make([]expression.Expression, 0, len(pp.PartitionBy))
+	for _, item := range pp.PartitionBy {
+		byItems = append(byItems, item.Col)
+	}
+	reqProp := &property.PhysicalProperty{ExpectedCnt: math.MaxFloat64}
+	shuffle := PhysicalShuffle{
+		Concurrency:  concurrency,
+		Tail:         tail,
+		DataSource:   dataSource,
+		SplitterType: PartitionHashSplitterType,
+		HashByItems:  byItems,
+	}.Init(ctx, pp.statsInfo(), pp.SelectBlockOffset(), reqProp)
+	return shuffle
 }
 
 // LogicalPlan is a tree of logical operators.
 // We can do a lot of logical optimizations to it, like predicate pushdown and column pruning.
 type LogicalPlan interface {
 	Plan
+
+	// HashCode encodes a LogicalPlan to fast compare whether a LogicalPlan equals to another.
+	// We use a strict encode method here which ensures there is no conflict.
+	HashCode() []byte
 
 	// PredicatePushDown pushes down the predicates in the where/on/having clauses as deeply as possible.
 	// It will accept a predicate that is an expression slice, and return the expressions that can't be pushed.
@@ -91,11 +154,18 @@ type LogicalPlan interface {
 	// findBestTask converts the logical plan to the physical plan. It's a new interface.
 	// It is called recursively from the parent to the children to create the result physical plan.
 	// Some logical plans will convert the children to the physical plans in different ways, and return the one
-	// with the lowest cost.
-	findBestTask(prop *property.PhysicalProperty) (task, error)
+	// With the lowest cost and how many plans are found in this function.
+	// planCounter is a counter for planner to force a plan.
+	// If planCounter > 0, the clock_th plan generated in this function will be returned.
+	// If planCounter = 0, the plan generated in this function will not be considered.
+	// If planCounter = -1, then we will not force plan.
+	findBestTask(prop *property.PhysicalProperty, planCounter *PlanCounterTp) (task, int64, error)
 
 	// BuildKeyInfo will collect the information of unique keys into schema.
-	BuildKeyInfo()
+	// Because this method is also used in cascades planner, we cannot use
+	// things like `p.schema` or `p.children` inside it. We should use the `selfSchema`
+	// and `childSchema` instead.
+	BuildKeyInfo(selfSchema *expression.Schema, childSchema []*expression.Schema)
 
 	// pushDownTopN will push down the topN or limit operator during logical optimization.
 	pushDownTopN(topN *LogicalTopN) LogicalPlan
@@ -108,16 +178,18 @@ type LogicalPlan interface {
 	// cascades planner, where LogicalPlan might not record its children or schema.
 	DeriveStats(childStats []*property.StatsInfo, selfSchema *expression.Schema, childSchema []*expression.Schema) (*property.StatsInfo, error)
 
-	// preparePossibleProperties is only used for join and aggregation. Like group by a,b,c, all permutation of (a,b,c) is
+	// PreparePossibleProperties is only used for join and aggregation. Like group by a,b,c, all permutation of (a,b,c) is
 	// valid, but the ordered indices in leaf plan is limited. So we can get all possible order properties by a pre-walking.
-	// Please make sure that children's method is called though we may not need its return value,
-	// so we can prepare possible properties for every LogicalPlan node.
-	preparePossibleProperties() [][]*expression.Column
+	PreparePossibleProperties(schema *expression.Schema, childrenProperties ...[][]*expression.Column) [][]*expression.Column
 
 	// exhaustPhysicalPlans generates all possible plans that can match the required property.
-	exhaustPhysicalPlans(*property.PhysicalProperty) []PhysicalPlan
+	// It will return:
+	// 1. All possible plans that can match the required property.
+	// 2. Whether the SQL hint can work. Return true if there is no hint.
+	exhaustPhysicalPlans(*property.PhysicalProperty) (physicalPlans []PhysicalPlan, hintCanWork bool)
 
-	extractCorrelatedCols() []*expression.CorrelatedColumn
+	// ExtractCorrelatedCols extracts correlated columns inside the LogicalPlan.
+	ExtractCorrelatedCols() []*expression.CorrelatedColumn
 
 	// MaxOneRow means whether this operator only returns max one row.
 	MaxOneRow() bool
@@ -130,6 +202,9 @@ type LogicalPlan interface {
 
 	// SetChild sets the ith child for the plan.
 	SetChild(i int, child LogicalPlan)
+
+	// rollBackTaskMap roll back all taskMap's logs after TimeStamp TS.
+	rollBackTaskMap(TS uint64)
 }
 
 // PhysicalPlan is a tree of the physical operators.
@@ -149,6 +224,9 @@ type PhysicalPlan interface {
 	// StatsCount returns the count of property.StatsInfo for this plan.
 	StatsCount() float64
 
+	// ExtractCorrelatedCols extracts correlated columns inside the PhysicalPlan.
+	ExtractCorrelatedCols() []*expression.CorrelatedColumn
+
 	// Get all the children.
 	Children() []PhysicalPlan
 
@@ -163,15 +241,25 @@ type PhysicalPlan interface {
 
 	// Stats returns the StatsInfo of the plan.
 	Stats() *property.StatsInfo
+
+	// ExplainNormalizedInfo returns operator normalized information for generating digest.
+	ExplainNormalizedInfo() string
+
+	// Clone clones this physical plan.
+	Clone() (PhysicalPlan, error)
 }
 
 type baseLogicalPlan struct {
 	basePlan
 
-	taskMap   map[string]task
-	self      LogicalPlan
-	maxOneRow bool
-	children  []LogicalPlan
+	taskMap map[string]task
+	// taskMapBak forms a backlog stack of taskMap, used to roll back the taskMap.
+	taskMapBak []string
+	// taskMapBakTS stores the timestamps of logs.
+	taskMapBakTS []uint64
+	self         LogicalPlan
+	maxOneRow    bool
+	children     []LogicalPlan
 }
 
 func (p *baseLogicalPlan) MaxOneRow() bool {
@@ -191,13 +279,80 @@ type basePhysicalPlan struct {
 	children         []PhysicalPlan
 }
 
+func (p *basePhysicalPlan) cloneWithSelf(newSelf PhysicalPlan) (*basePhysicalPlan, error) {
+	base := &basePhysicalPlan{
+		basePlan: p.basePlan,
+		self:     newSelf,
+	}
+	for _, child := range p.children {
+		cloned, err := child.Clone()
+		if err != nil {
+			return nil, err
+		}
+		base.children = append(base.children, cloned)
+	}
+	for _, prop := range p.childrenReqProps {
+		base.childrenReqProps = append(base.childrenReqProps, prop.Clone())
+	}
+	return base, nil
+}
+
+// Clone implements PhysicalPlan interface.
+func (p *basePhysicalPlan) Clone() (PhysicalPlan, error) {
+	return nil, errors.Errorf("%T doesn't support cloning", p.self)
+}
+
 // ExplainInfo implements Plan interface.
 func (p *basePhysicalPlan) ExplainInfo() string {
 	return ""
 }
 
+// ExplainInfo implements Plan interface.
+func (p *basePhysicalPlan) ExplainNormalizedInfo() string {
+	return ""
+}
+
 func (p *basePhysicalPlan) GetChildReqProps(idx int) *property.PhysicalProperty {
 	return p.childrenReqProps[idx]
+}
+
+// ExtractCorrelatedCols implements PhysicalPlan interface.
+func (p *basePhysicalPlan) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	return nil
+}
+
+// GetlogicalTS4TaskMap get the logical TimeStamp now to help rollback the TaskMap changes after that.
+func (p *baseLogicalPlan) GetlogicalTS4TaskMap() uint64 {
+	p.ctx.GetSessionVars().StmtCtx.TaskMapBakTS += 1
+	return p.ctx.GetSessionVars().StmtCtx.TaskMapBakTS
+}
+
+func (p *baseLogicalPlan) rollBackTaskMap(TS uint64) {
+	if !p.ctx.GetSessionVars().StmtCtx.StmtHints.TaskMapNeedBackUp() {
+		return
+	}
+	if len(p.taskMapBak) > 0 {
+		// Rollback all the logs with TimeStamp TS.
+		N := len(p.taskMapBak)
+		for i := 0; i < N; i++ {
+			cur := p.taskMapBak[i]
+			if p.taskMapBakTS[i] < TS {
+				continue
+			}
+
+			// Remove the i_th log.
+			p.taskMapBak = append(p.taskMapBak[:i], p.taskMapBak[i+1:]...)
+			p.taskMapBakTS = append(p.taskMapBakTS[:i], p.taskMapBakTS[i+1:]...)
+			i--
+			N--
+
+			// Roll back taskMap.
+			p.taskMap[cur] = nil
+		}
+	}
+	for _, child := range p.children {
+		child.rollBackTaskMap(TS)
+	}
 }
 
 func (p *baseLogicalPlan) getTask(prop *property.PhysicalProperty) task {
@@ -207,20 +362,53 @@ func (p *baseLogicalPlan) getTask(prop *property.PhysicalProperty) task {
 
 func (p *baseLogicalPlan) storeTask(prop *property.PhysicalProperty, task task) {
 	key := prop.HashCode()
+	if p.ctx.GetSessionVars().StmtCtx.StmtHints.TaskMapNeedBackUp() {
+		// Empty string for useless change.
+		TS := p.GetlogicalTS4TaskMap()
+		p.taskMapBakTS = append(p.taskMapBakTS, TS)
+		p.taskMapBak = append(p.taskMapBak, string(key))
+	}
 	p.taskMap[string(key)] = task
 }
 
-// BuildKeyInfo implements LogicalPlan BuildKeyInfo interface.
-func (p *baseLogicalPlan) BuildKeyInfo() {
-	for _, child := range p.children {
-		child.BuildKeyInfo()
+// HasMaxOneRow returns if the LogicalPlan will output at most one row.
+func HasMaxOneRow(p LogicalPlan, childMaxOneRow []bool) bool {
+	if len(childMaxOneRow) == 0 {
+		// The reason why we use this check is that, this function
+		// is used both in planner/core and planner/cascades.
+		// In cascades planner, LogicalPlan may have no `children`.
+		return false
 	}
-	switch p.self.(type) {
-	case *LogicalLock, *LogicalLimit, *LogicalSort, *LogicalSelection, *LogicalApply, *LogicalProjection:
-		p.maxOneRow = p.children[0].MaxOneRow()
+	switch x := p.(type) {
+	case *LogicalLock, *LogicalLimit, *LogicalSort, *LogicalSelection,
+		*LogicalApply, *LogicalProjection, *LogicalWindow, *LogicalAggregation:
+		return childMaxOneRow[0]
 	case *LogicalMaxOneRow:
-		p.maxOneRow = true
+		return true
+	case *LogicalJoin:
+		switch x.JoinType {
+		case SemiJoin, AntiSemiJoin, LeftOuterSemiJoin, AntiLeftOuterSemiJoin:
+			return childMaxOneRow[0]
+		default:
+			return childMaxOneRow[0] && childMaxOneRow[1]
+		}
 	}
+	return false
+}
+
+// BuildKeyInfo implements LogicalPlan BuildKeyInfo interface.
+func (p *baseLogicalPlan) BuildKeyInfo(selfSchema *expression.Schema, childSchema []*expression.Schema) {
+	childMaxOneRow := make([]bool, len(p.children))
+	for i := range p.children {
+		childMaxOneRow[i] = p.children[i].MaxOneRow()
+	}
+	p.maxOneRow = HasMaxOneRow(p.self, childMaxOneRow)
+}
+
+// BuildKeyInfo implements LogicalPlan BuildKeyInfo interface.
+func (p *logicalSchemaProducer) BuildKeyInfo(selfSchema *expression.Schema, childSchema []*expression.Schema) {
+	selfSchema.Keys = nil
+	p.baseLogicalPlan.BuildKeyInfo(selfSchema, childSchema)
 }
 
 func newBasePlan(ctx sessionctx.Context, tp string, offset int) basePlan {
@@ -236,9 +424,11 @@ func newBasePlan(ctx sessionctx.Context, tp string, offset int) basePlan {
 
 func newBaseLogicalPlan(ctx sessionctx.Context, tp string, self LogicalPlan, offset int) baseLogicalPlan {
 	return baseLogicalPlan{
-		taskMap:  make(map[string]task),
-		basePlan: newBasePlan(ctx, tp, offset),
-		self:     self,
+		taskMap:      make(map[string]task),
+		taskMapBak:   make([]string, 0, 10),
+		taskMapBakTS: make([]uint64, 0, 10),
+		basePlan:     newBasePlan(ctx, tp, offset),
+		self:         self,
 	}
 }
 
@@ -249,12 +439,8 @@ func newBasePhysicalPlan(ctx sessionctx.Context, tp string, self PhysicalPlan, o
 	}
 }
 
-func (p *baseLogicalPlan) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := make([]*expression.CorrelatedColumn, 0, len(p.children))
-	for _, child := range p.children {
-		corCols = append(corCols, child.extractCorrelatedCols()...)
-	}
-	return corCols
+func (p *baseLogicalPlan) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	return nil
 }
 
 // PruneColumns implements LogicalPlan interface.

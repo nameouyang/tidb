@@ -142,7 +142,12 @@ func (b *builtinDecimalIsFalseSig) vecEvalInt(input *chunk.Chunk, result *chunk.
 	i64s := result.Int64s()
 
 	for i := 0; i < numRows; i++ {
-		if buf.IsNull(i) || !decs[i].IsZero() {
+		isNull := buf.IsNull(i)
+		if b.keepNull && isNull {
+			result.SetNull(i, true)
+			continue
+		}
+		if isNull || !decs[i].IsZero() {
 			i64s[i] = 0
 		} else {
 			i64s[i] = 1
@@ -162,7 +167,11 @@ func (b *builtinIntIsFalseSig) vecEvalInt(input *chunk.Chunk, result *chunk.Colu
 	}
 	i64s := result.Int64s()
 	for i := 0; i < numRows; i++ {
-		if result.IsNull(i) {
+		isNull := result.IsNull(i)
+		if b.keepNull && isNull {
+			continue
+		}
+		if isNull {
 			i64s[i] = 0
 			result.SetNull(i, false)
 		} else if i64s[i] != 0 {
@@ -467,7 +476,12 @@ func (b *builtinRealIsFalseSig) vecEvalInt(input *chunk.Chunk, result *chunk.Col
 	i64s := result.Int64s()
 	bufI64s := buf.Int64s()
 	for i := 0; i < numRows; i++ {
-		if buf.IsNull(i) || bufI64s[i] != 0 {
+		isNull := buf.IsNull(i)
+		if b.keepNull && isNull {
+			result.SetNull(i, true)
+			continue
+		}
+		if isNull || bufI64s[i] != 0 {
 			i64s[i] = 0
 		} else {
 			i64s[i] = 1
@@ -488,6 +502,9 @@ func (b *builtinUnaryMinusIntSig) vecEvalInt(input *chunk.Chunk, result *chunk.C
 	args := result.Int64s()
 	if mysql.HasUnsignedFlag(b.args[0].GetType().Flag) {
 		for i := 0; i < n; i++ {
+			if result.IsNull(i) {
+				continue
+			}
 			if uint64(args[i]) > uint64(-math.MinInt64) {
 				return types.ErrOverflow.GenWithStackByArgs("BIGINT", fmt.Sprintf("-%v", uint64(args[i])))
 			}
@@ -495,6 +512,9 @@ func (b *builtinUnaryMinusIntSig) vecEvalInt(input *chunk.Chunk, result *chunk.C
 		}
 	} else {
 		for i := 0; i < n; i++ {
+			if result.IsNull(i) {
+				continue
+			}
 			if args[i] == math.MinInt64 {
 				return types.ErrOverflow.GenWithStackByArgs("BIGINT", fmt.Sprintf("-%v", args[i]))
 			}
@@ -659,7 +679,12 @@ func (b *builtinRealIsTrueSig) vecEvalInt(input *chunk.Chunk, result *chunk.Colu
 	f64s := buf.Float64s()
 	i64s := result.Int64s()
 	for i := 0; i < numRows; i++ {
-		if buf.IsNull(i) || f64s[i] == 0 {
+		isNull := buf.IsNull(i)
+		if b.keepNull && isNull {
+			result.SetNull(i, true)
+			continue
+		}
+		if isNull || f64s[i] == 0 {
 			i64s[i] = 0
 		} else {
 			i64s[i] = 1
@@ -688,7 +713,12 @@ func (b *builtinDecimalIsTrueSig) vecEvalInt(input *chunk.Chunk, result *chunk.C
 	i64s := result.Int64s()
 
 	for i := 0; i < numRows; i++ {
-		if buf.IsNull(i) || decs[i].IsZero() {
+		isNull := buf.IsNull(i)
+		if b.keepNull && isNull {
+			result.SetNull(i, true)
+			continue
+		}
+		if isNull || decs[i].IsZero() {
 			i64s[i] = 0
 		} else {
 			i64s[i] = 1
@@ -708,7 +738,11 @@ func (b *builtinIntIsTrueSig) vecEvalInt(input *chunk.Chunk, result *chunk.Colum
 	}
 	i64s := result.Int64s()
 	for i := 0; i < numRows; i++ {
-		if result.IsNull(i) {
+		isNull := result.IsNull(i)
+		if b.keepNull && isNull {
+			continue
+		}
+		if isNull {
 			i64s[i] = 0
 			result.SetNull(i, false)
 		} else if i64s[i] != 0 {

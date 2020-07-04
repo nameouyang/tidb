@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cznic/mathutil"
@@ -56,6 +58,7 @@ func initChunks(numChk, numRow int) ([]*Chunk, []*types.FieldType) {
 }
 
 func (s *testChunkSuite) TestListInDisk(c *check.C) {
+
 	numChk, numRow := 2, 2
 	chks, fields := initChunks(numChk, numRow)
 	l := NewListInDisk(fields)
@@ -70,7 +73,7 @@ func (s *testChunkSuite) TestListInDisk(c *check.C) {
 		err := l.Add(chk)
 		c.Check(err, check.IsNil)
 	}
-
+	c.Assert(strings.HasPrefix(l.disk.Name(), filepath.Join(os.TempDir(), "oom-use-tmp-storage")), check.Equals, true)
 	c.Check(l.NumChunks(), check.Equals, numChk)
 	c.Check(l.GetDiskTracker().BytesConsumed() > 0, check.IsTrue)
 

@@ -18,8 +18,10 @@ import (
 	"strconv"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	"go.uber.org/zap"
 )
 
 // RoundMode is the type for round mode.
@@ -248,6 +250,11 @@ func (d *MyDecimal) IsNegative() bool {
 // GetDigitsFrac returns the digitsFrac.
 func (d *MyDecimal) GetDigitsFrac() int8 {
 	return d.digitsFrac
+}
+
+// GetDigitsInt returns the digitsInt.
+func (d *MyDecimal) GetDigitsInt() int8 {
+	return d.digitsInt
 }
 
 // String returns the decimal string representation rounded to resultFrac.
@@ -1157,8 +1164,13 @@ with the correct -1/0/+1 result
                 7E F2 04 C7 2D FB 2D
 */
 func (d *MyDecimal) ToBin(precision, frac int) ([]byte, error) {
+	return d.WriteBin(precision, frac, []byte{})
+}
+
+// WriteBin encode and write the binary encoded to target buffer
+func (d *MyDecimal) WriteBin(precision, frac int, buf []byte) ([]byte, error) {
 	if precision > digitsPerWord*maxWordBufLen || precision < 0 || frac > mysql.MaxDecimalScale || frac < 0 {
-		return nil, ErrBadNumber
+		return buf, ErrBadNumber
 	}
 	var err error
 	var mask int32
@@ -1178,7 +1190,13 @@ func (d *MyDecimal) ToBin(precision, frac int) ([]byte, error) {
 	fracSizeFrom := wordsFracFrom*wordSize + dig2bytes[trailingDigitsFrom]
 	originIntSize := intSize
 	originFracSize := fracSize
-	bin := make([]byte, intSize+fracSize)
+	bufLen := len(buf)
+	if bufLen+intSize+fracSize <= cap(buf) {
+		buf = buf[:bufLen+intSize+fracSize]
+	} else {
+		buf = append(buf, make([]byte, intSize+fracSize)...)
+	}
+	bin := buf[bufLen:]
 	binIdx := 0
 	wordIdxFrom, digitsIntFrom := d.removeLeadingZeros()
 	if digitsIntFrom+fracSizeFrom == 0 {
@@ -1263,7 +1281,7 @@ func (d *MyDecimal) ToBin(precision, frac int) ([]byte, error) {
 		}
 	}
 	bin[0] ^= 0x80
-	return bin, err
+	return buf, err
 }
 
 // ToHashKey removes the leading and trailing zeros and generates a hash key.
@@ -1781,10 +1799,10 @@ func doAdd(from1, from2, to *MyDecimal) error {
 	stop = 0
 	if wordsInt1 > wordsInt2 {
 		idx1 = wordsInt1 - wordsInt2
-		dec1, dec2 = from1, from2
+		dec1 = from1
 	} else {
 		idx1 = wordsInt2 - wordsInt1
-		dec1, dec2 = from2, from1
+		dec1 = from2
 	}
 	for idx1 > stop {
 		idxTo--
@@ -2286,7 +2304,9 @@ func NewDecFromUint(i uint64) *MyDecimal {
 func NewDecFromFloatForTest(f float64) *MyDecimal {
 	dec := new(MyDecimal)
 	err := dec.FromFloat64(f)
-	terror.Log(errors.Trace(err))
+	if err != nil {
+		log.Panic("encountered error", zap.Error(err), zap.String("DecimalStr", strconv.FormatFloat(f, 'g', -1, 64)))
+	}
 	return dec
 }
 
@@ -2294,7 +2314,9 @@ func NewDecFromFloatForTest(f float64) *MyDecimal {
 func NewDecFromStringForTest(s string) *MyDecimal {
 	dec := new(MyDecimal)
 	err := dec.FromString([]byte(s))
-	terror.Log(errors.Trace(err))
+	if err != nil {
+		log.Panic("encountered error", zap.Error(err), zap.String("DecimalStr", s))
+	}
 	return dec
 }
 

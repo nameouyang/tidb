@@ -34,6 +34,8 @@ const (
 	TypeJoin = "Join"
 	// TypeUnion is the type of Union.
 	TypeUnion = "Union"
+	// TypePartitionUnion is the type of PartitionUnion
+	TypePartitionUnion = "PartitionUnion"
 	// TypeTableScan is the type of TableScan.
 	TypeTableScan = "TableScan"
 	// TypeMemTableScan is the type of TableScan.
@@ -48,10 +50,8 @@ const (
 	TypeTopN = "TopN"
 	// TypeLimit is the type of Limit.
 	TypeLimit = "Limit"
-	// TypeHashLeftJoin is the type of left hash join.
-	TypeHashLeftJoin = "HashLeftJoin"
-	// TypeHashRightJoin is the type of right hash join.
-	TypeHashRightJoin = "HashRightJoin"
+	// TypeHashJoin is the type of hash join.
+	TypeHashJoin = "HashJoin"
 	// TypeMergeJoin is the type of merge join.
 	TypeMergeJoin = "MergeJoin"
 	// TypeIndexJoin is the type of index look up join.
@@ -84,8 +84,12 @@ const (
 	TypeIndexReader = "IndexReader"
 	// TypeWindow is the type of Window.
 	TypeWindow = "Window"
-	// TypeTableGather is the type of TableGather.
-	TypeTableGather = "TableGather"
+	// TypeShuffle is the type of Shuffle.
+	TypeShuffle = "Shuffle"
+	// TypeShuffleDataSourceStub is the type of Shuffle.
+	TypeShuffleDataSourceStub = "ShuffleDataSourceStub"
+	// TypeTiKVSingleGather is the type of TiKVSingleGather.
+	TypeTiKVSingleGather = "TiKVSingleGather"
 	// TypeIndexMerge is the type of IndexMergeReader
 	TypeIndexMerge = "IndexMerge"
 	// TypePointGet is the type of PointGetPlan.
@@ -94,49 +98,55 @@ const (
 	TypeShowDDLJobs = "ShowDDLJobs"
 	// TypeBatchPointGet is the type of BatchPointGetPlan.
 	TypeBatchPointGet = "Batch_Point_Get"
+	// TypeClusterMemTableReader is the type of TableReader.
+	TypeClusterMemTableReader = "ClusterMemTableReader"
+	// TypeDataSource is the type of DataSource.
+	TypeDataSource = "DataSource"
 )
 
 // plan id.
+// Attention: for compatibility of encode/decode plan, The plan id shouldn't be changed.
 const (
-	typeSelID int = iota + 1
-	typeSetID
-	typeProjID
-	typeAggID
-	typeStreamAggID
-	typeHashAggID
-	typeShowID
-	typeJoinID
-	typeUnionID
-	typeTableScanID
-	typeMemTableScanID
-	typeUnionScanID
-	typeIdxScanID
-	typeSortID
-	typeTopNID
-	typeLimitID
-	typeHashLeftJoinID
-	typeHashRightJoinID
-	typeMergeJoinID
-	typeIndexJoinID
-	typeIndexMergeJoinID
-	typeIndexHashJoinID
-	typeApplyID
-	typeMaxOneRowID
-	typeExistsID
-	typeDualID
-	typeLockID
-	typeInsertID
-	typeUpdateID
-	typeDeleteID
-	typeIndexLookUpID
-	typeTableReaderID
-	typeIndexReaderID
-	typeWindowID
-	typeTableGatherID
-	typeIndexMergeID
-	typePointGet
-	typeShowDDLJobs
-	typeBatchPointGet
+	typeSelID                 int = 1
+	typeSetID                     = 2
+	typeProjID                    = 3
+	typeAggID                     = 4
+	typeStreamAggID               = 5
+	typeHashAggID                 = 6
+	typeShowID                    = 7
+	typeJoinID                    = 8
+	typeUnionID                   = 9
+	typeTableScanID               = 10
+	typeMemTableScanID            = 11
+	typeUnionScanID               = 12
+	typeIdxScanID                 = 13
+	typeSortID                    = 14
+	typeTopNID                    = 15
+	typeLimitID                   = 16
+	typeHashJoinID                = 17
+	typeMergeJoinID               = 18
+	typeIndexJoinID               = 19
+	typeIndexMergeJoinID          = 20
+	typeIndexHashJoinID           = 21
+	typeApplyID                   = 22
+	typeMaxOneRowID               = 23
+	typeExistsID                  = 24
+	typeDualID                    = 25
+	typeLockID                    = 26
+	typeInsertID                  = 27
+	typeUpdateID                  = 28
+	typeDeleteID                  = 29
+	typeIndexLookUpID             = 30
+	typeTableReaderID             = 31
+	typeIndexReaderID             = 32
+	typeWindowID                  = 33
+	typeTiKVSingleGatherID        = 34
+	typeIndexMergeID              = 35
+	typePointGet                  = 36
+	typeShowDDLJobs               = 37
+	typeBatchPointGet             = 38
+	typeClusterMemTableReader     = 39
+	typeDataSourceID              = 40
 )
 
 // TypeStringToPhysicalID converts the plan type string to plan id.
@@ -174,10 +184,8 @@ func TypeStringToPhysicalID(tp string) int {
 		return typeTopNID
 	case TypeLimit:
 		return typeLimitID
-	case TypeHashLeftJoin:
-		return typeHashLeftJoinID
-	case TypeHashRightJoin:
-		return typeHashRightJoinID
+	case TypeHashJoin:
+		return typeHashJoinID
 	case TypeMergeJoin:
 		return typeMergeJoinID
 	case TypeIndexJoin:
@@ -210,8 +218,8 @@ func TypeStringToPhysicalID(tp string) int {
 		return typeIndexReaderID
 	case TypeWindow:
 		return typeWindowID
-	case TypeTableGather:
-		return typeTableGatherID
+	case TypeTiKVSingleGather:
+		return typeTiKVSingleGatherID
 	case TypeIndexMerge:
 		return typeIndexMergeID
 	case TypePointGet:
@@ -220,6 +228,10 @@ func TypeStringToPhysicalID(tp string) int {
 		return typeShowDDLJobs
 	case TypeBatchPointGet:
 		return typeBatchPointGet
+	case TypeClusterMemTableReader:
+		return typeClusterMemTableReader
+	case TypeDataSource:
+		return typeDataSourceID
 	}
 	// Should never reach here.
 	return 0
@@ -260,10 +272,8 @@ func PhysicalIDToTypeString(id int) string {
 		return TypeTopN
 	case typeLimitID:
 		return TypeLimit
-	case typeHashLeftJoinID:
-		return TypeHashLeftJoin
-	case typeHashRightJoinID:
-		return TypeHashRightJoin
+	case typeHashJoinID:
+		return TypeHashJoin
 	case typeMergeJoinID:
 		return TypeMergeJoin
 	case typeIndexJoinID:
@@ -296,8 +306,8 @@ func PhysicalIDToTypeString(id int) string {
 		return TypeIndexReader
 	case typeWindowID:
 		return TypeWindow
-	case typeTableGatherID:
-		return TypeTableGather
+	case typeTiKVSingleGatherID:
+		return TypeTiKVSingleGather
 	case typeIndexMergeID:
 		return TypeIndexMerge
 	case typePointGet:
@@ -306,6 +316,8 @@ func PhysicalIDToTypeString(id int) string {
 		return TypeShowDDLJobs
 	case typeBatchPointGet:
 		return TypeBatchPointGet
+	case typeClusterMemTableReader:
+		return TypeClusterMemTableReader
 	}
 
 	// Should never reach here.

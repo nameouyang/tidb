@@ -14,7 +14,6 @@
 package expression
 
 import (
-	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -266,7 +265,7 @@ func (b *builtinLeastStringSig) vecEvalString(input *chunk.Chunk, result *chunk.
 			}
 			srcStr := src.GetString(i)
 			argStr := arg.GetString(i)
-			if types.CompareString(srcStr, argStr) < 0 {
+			if types.CompareString(srcStr, argStr, b.collation) < 0 {
 				dst.AppendString(srcStr)
 			} else {
 				dst.AppendString(argStr)
@@ -707,11 +706,67 @@ func (b *builtinGreatestRealSig) vecEvalReal(input *chunk.Chunk, result *chunk.C
 }
 
 func (b *builtinLeastTimeSig) vectorized() bool {
-	return false
+	return true
 }
 
 func (b *builtinLeastTimeSig) vecEvalString(input *chunk.Chunk, result *chunk.Column) error {
-	return errors.Errorf("not implemented")
+	n := input.NumRows()
+	dst, err := b.bufAllocator.get(types.ETTimestamp, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(dst)
+
+	sc := b.ctx.GetSessionVars().StmtCtx
+	dst.ResizeTime(n, false)
+	dstTimes := dst.Times()
+	for i := 0; i < n; i++ {
+		dstTimes[i] = types.NewTime(types.MaxDatetime, mysql.TypeDatetime, types.DefaultFsp)
+	}
+	var argTime types.Time
+
+	findInvalidTime := make([]bool, n)
+	invalidValue := make([]string, n)
+
+	for j := 0; j < len(b.args); j++ {
+		if err := b.args[j].VecEvalString(b.ctx, input, result); err != nil {
+			return err
+		}
+		dst.MergeNulls(result)
+		for i := 0; i < n; i++ {
+			if dst.IsNull(i) {
+				continue
+			}
+			argTime, err = types.ParseDatetime(sc, result.GetString(i))
+			if err != nil {
+				if err = handleInvalidTimeError(b.ctx, err); err != nil {
+					return err
+				} else if !findInvalidTime[i] {
+					// Make a deep copy here.
+					// Otherwise invalidValue will internally change with result.
+					invalidValue[i] = string(result.GetBytes(i))
+					findInvalidTime[i] = true
+				}
+				continue
+			}
+			if argTime.Compare(dstTimes[i]) < 0 {
+				dstTimes[i] = argTime
+			}
+		}
+	}
+	result.ReserveString(n)
+	for i := 0; i < n; i++ {
+		if dst.IsNull(i) {
+			result.AppendNull()
+			continue
+		}
+		if findInvalidTime[i] {
+			result.AppendString(invalidValue[i])
+		} else {
+			result.AppendString(dstTimes[i].String())
+		}
+	}
+	return nil
 }
 
 func (b *builtinGreatestStringSig) vectorized() bool {
@@ -749,7 +804,7 @@ func (b *builtinGreatestStringSig) vecEvalString(input *chunk.Chunk, result *chu
 			}
 			srcStr := src.GetString(i)
 			argStr := arg.GetString(i)
-			if types.CompareString(srcStr, argStr) > 0 {
+			if types.CompareString(srcStr, argStr, b.collation) > 0 {
 				dst.AppendString(srcStr)
 			} else {
 				dst.AppendString(argStr)

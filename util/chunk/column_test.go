@@ -775,7 +775,7 @@ func (s *testChunkSuite) TestGetRaw(c *check.C) {
 	i = 0
 	for row := it.Begin(); row != it.End(); row = it.Next() {
 		c.Assert(row.GetRaw(0), check.DeepEquals, []byte(fmt.Sprint(i)))
-		c.Assert(col.GetRaw(int(i)), check.DeepEquals, []byte(fmt.Sprint(i)))
+		c.Assert(col.GetRaw(i), check.DeepEquals, []byte(fmt.Sprint(i)))
 		i++
 	}
 }
@@ -830,7 +830,7 @@ func (s *testChunkSuite) TestResize(c *check.C) {
 	col = NewColumn(types.NewFieldType(mysql.TypeDatetime), 1024)
 	for i := 0; i < 1024; i++ {
 		gt := types.FromDate(rand.Intn(2200), rand.Intn(10)+1, rand.Intn(20)+1, rand.Intn(12), rand.Intn(60), rand.Intn(60), rand.Intn(1000000))
-		t := types.Time{Time: gt}
+		t := types.NewTime(gt, 0, 0)
 		col.AppendTime(t)
 	}
 	col.ResizeTime(1024, false)

@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -35,7 +37,7 @@ import (
 
 var (
 	null          = []byte("NULL")
-	taskQueueSize = 64 // the maximum number of pending tasks to commit in queue
+	taskQueueSize = 16 // the maximum number of pending tasks to commit in queue
 )
 
 // LoadDataExec represents a load data executor.
@@ -121,6 +123,7 @@ type LoadDataInfo struct {
 	IgnoreLines uint64
 	Ctx         sessionctx.Context
 	rows        [][]types.Datum
+	Drained     bool
 
 	commitTaskQueue chan CommitTask
 	StopCh          chan struct{}
@@ -204,7 +207,7 @@ func (e *LoadDataInfo) CommitOneTask(ctx context.Context, task CommitTask) error
 	failpoint.Inject("commitOneTaskErr", func() error {
 		return errors.New("mock commit one task error")
 	})
-	if err = e.Ctx.StmtCommit(); err != nil {
+	if err = e.Ctx.StmtCommit(nil); err != nil {
 		logutil.Logger(ctx).Error("commit error commit", zap.Error(err))
 		return err
 	}
@@ -233,28 +236,38 @@ func (e *LoadDataInfo) CommitWork(ctx context.Context) error {
 			e.ctx.StmtRollback()
 		}
 	}()
-	var tasks uint64 = 0
+	var tasks uint64
 	var end = false
 	for !end {
 		select {
 		case <-e.QuitCh:
 			err = errors.New("commit forced to quit")
 			logutil.Logger(ctx).Error("commit forced to quit, possible preparation failed")
-			break
+			return err
 		case commitTask, ok := <-e.commitTaskQueue:
 			if ok {
+				start := time.Now()
 				err = e.CommitOneTask(ctx, commitTask)
 				if err != nil {
 					break
 				}
 				tasks++
+				logutil.Logger(ctx).Info("commit one task success",
+					zap.Duration("commit time usage", time.Since(start)),
+					zap.Uint64("keys processed", commitTask.cnt),
+					zap.Uint64("tasks processed", tasks),
+					zap.Int("tasks in queue", len(e.commitTaskQueue)))
 			} else {
 				end = true
-				break
 			}
 		}
 		if err != nil {
 			logutil.Logger(ctx).Error("load data commit work error", zap.Error(err))
+			break
+		}
+		if atomic.CompareAndSwapUint32(&e.Ctx.GetSessionVars().Killed, 1, 0) {
+			logutil.Logger(ctx).Info("load data query interrupted quit data processing")
+			err = ErrQueryInterrupted
 			break
 		}
 	}
@@ -265,9 +278,6 @@ func (e *LoadDataInfo) CommitWork(ctx context.Context) error {
 func (e *LoadDataInfo) SetMaxRowsInBatch(limit uint64) {
 	e.maxRowsInBatch = limit
 	e.rows = make([][]types.Datum, 0, limit)
-	for i := 0; uint64(i) < limit; i++ {
-		e.rows = append(e.rows, make([]types.Datum, len(e.Table.Cols())))
-	}
 	e.curBatchCnt = 0
 }
 
@@ -412,7 +422,7 @@ func (e *LoadDataInfo) InsertData(ctx context.Context, prevData, curData []byte)
 		// rowCount will be used in fillRow(), last insert ID will be assigned according to the rowCount = 1.
 		// So should add first here.
 		e.rowCount++
-		e.colsToRow(ctx, cols)
+		e.rows = append(e.rows, e.colsToRow(ctx, cols))
 		e.curBatchCnt++
 		if e.maxRowsInBatch != 0 && e.rowCount%e.maxRowsInBatch == 0 {
 			reachLimit = true
@@ -467,10 +477,11 @@ func (e *LoadDataInfo) colsToRow(ctx context.Context, cols []field) []types.Datu
 		if cols[i].maybeNull && string(cols[i].str) == "N" {
 			e.row[i].SetNull()
 		} else {
-			e.row[i].SetString(string(cols[i].str))
+			e.row[i].SetString(string(cols[i].str), mysql.DefaultCollationName)
 		}
 	}
-	row, err := e.getRowInPlace(ctx, e.row, e.rows[e.curBatchCnt])
+	// a new row buffer will be allocated in getRow
+	row, err := e.getRow(ctx, e.row)
 	if err != nil {
 		e.handleWarning(err)
 		return nil
@@ -478,15 +489,16 @@ func (e *LoadDataInfo) colsToRow(ctx context.Context, cols []field) []types.Datu
 	return row
 }
 
-func (e *LoadDataInfo) addRecordLD(ctx context.Context, row []types.Datum) (int64, error) {
+func (e *LoadDataInfo) addRecordLD(ctx context.Context, row []types.Datum) error {
 	if row == nil {
-		return 0, nil
+		return nil
 	}
-	h, err := e.addRecord(ctx, row)
+	err := e.addRecord(ctx, row)
 	if err != nil {
 		e.handleWarning(err)
+		return err
 	}
-	return h, nil
+	return nil
 }
 
 type field struct {
@@ -499,9 +511,9 @@ type fieldWriter struct {
 	pos           int
 	ReadBuf       []byte
 	OutputBuf     []byte
+	term          string
 	enclosedChar  byte
 	fieldTermChar byte
-	term          string
 	isEnclosed    bool
 	isLineStart   bool
 	isFieldStart  bool
@@ -620,14 +632,12 @@ func (w *fieldWriter) GetField() (bool, field) {
 			}
 		} else if ch == '\\' {
 			// TODO: escape only support '\'
-			w.OutputBuf = append(w.OutputBuf, ch)
+			// When the escaped character is interpreted as if
+			// it was not escaped, backslash is ignored.
 			flag, ch = w.getChar()
 			if flag {
-				if ch == w.enclosedChar {
-					w.OutputBuf = append(w.OutputBuf, ch)
-				} else {
-					w.putback()
-				}
+				w.OutputBuf = append(w.OutputBuf, '\\')
+				w.OutputBuf = append(w.OutputBuf, ch)
 			}
 		} else {
 			w.OutputBuf = append(w.OutputBuf, ch)

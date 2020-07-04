@@ -31,10 +31,11 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tipb/go-tipb"
-	"github.com/spaolacci/murmur3"
+	"github.com/twmb/murmur3"
 	"go.uber.org/zap"
 )
 
@@ -64,6 +65,7 @@ type Histogram struct {
 	// For some types like `Int`, we do not build it because we can get them directly from `Bounds`.
 	scalars []scalar
 	// TotColSize is the total column size for the histogram.
+	// For unfixed-len types, it includes LEN and BYTE.
 	TotColSize int64
 
 	// Correlation is the statistical correlation between physical row ordering and logical ordering of
@@ -138,6 +140,50 @@ func (c *Column) AvgColSize(count int64, isKey bool) float64 {
 	}
 	// Keep two decimal place.
 	return math.Round(float64(c.TotColSize)/float64(count)*100) / 100
+}
+
+// AvgColSizeChunkFormat is the average column size of the histogram. These sizes are derived from function `Encode`
+// and `DecodeToChunk`, so we need to update them if those 2 functions are changed.
+func (c *Column) AvgColSizeChunkFormat(count int64) float64 {
+	if count == 0 {
+		return 0
+	}
+	fixedLen := chunk.GetFixedLen(c.Histogram.Tp)
+	if fixedLen != -1 {
+		return float64(fixedLen)
+	}
+	// Keep two decimal place.
+	// Add 8 bytes for unfixed-len type's offsets.
+	// Minus Log2(avgSize) for unfixed-len type LEN.
+	avgSize := float64(c.TotColSize) / float64(count)
+	if avgSize < 1 {
+		return math.Round(avgSize*100)/100 + 8
+	}
+	return math.Round((avgSize-math.Log2(avgSize))*100)/100 + 8
+}
+
+// AvgColSizeListInDisk is the average column size of the histogram. These sizes are derived
+// from `chunk.ListInDisk` so we need to update them if those 2 functions are changed.
+func (c *Column) AvgColSizeListInDisk(count int64) float64 {
+	if count == 0 {
+		return 0
+	}
+	histCount := c.TotalRowCount()
+	notNullRatio := 1.0
+	if histCount > 0 {
+		notNullRatio = 1.0 - float64(c.NullCount)/histCount
+	}
+	size := chunk.GetFixedLen(c.Histogram.Tp)
+	if size != -1 {
+		return float64(size) * notNullRatio
+	}
+	// Keep two decimal place.
+	// Minus Log2(avgSize) for unfixed-len type LEN.
+	avgSize := float64(c.TotColSize) / float64(count)
+	if avgSize < 1 {
+		return math.Round((avgSize)*100) / 100
+	}
+	return math.Round((avgSize-math.Log2(avgSize))*100) / 100
 }
 
 // AppendBucket appends a bucket into `hg`.
@@ -731,7 +777,23 @@ func (c *Column) equalRowCount(sc *stmtctx.StatementContext, val types.Datum, mo
 func (c *Column) GetColumnRowCount(sc *stmtctx.StatementContext, ranges []*ranger.Range, modifyCount int64, pkIsHandle bool) (float64, error) {
 	var rowCount float64
 	for _, rg := range ranges {
-		cmp, err := rg.LowVal[0].CompareDatum(sc, &rg.HighVal[0])
+		highVal := *rg.HighVal[0].Clone()
+		lowVal := *rg.LowVal[0].Clone()
+		if highVal.Kind() == types.KindString {
+			highVal.SetBytesAsString(collate.GetCollator(
+				highVal.Collation()).Key(highVal.GetString()),
+				highVal.Collation(),
+				uint32(highVal.Length()),
+			)
+		}
+		if lowVal.Kind() == types.KindString {
+			lowVal.SetBytesAsString(collate.GetCollator(
+				lowVal.Collation()).Key(lowVal.GetString()),
+				lowVal.Collation(),
+				uint32(lowVal.Length()),
+			)
+		}
+		cmp, err := lowVal.CompareDatum(sc, &highVal)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -744,7 +806,7 @@ func (c *Column) GetColumnRowCount(sc *stmtctx.StatementContext, ranges []*range
 					continue
 				}
 				var cnt float64
-				cnt, err = c.equalRowCount(sc, rg.LowVal[0], modifyCount)
+				cnt, err = c.equalRowCount(sc, lowVal, modifyCount)
 				if err != nil {
 					return 0, errors.Trace(err)
 				}
@@ -752,7 +814,7 @@ func (c *Column) GetColumnRowCount(sc *stmtctx.StatementContext, ranges []*range
 			}
 			continue
 		}
-		rangeVals := enumRangeValues(rg.LowVal[0], rg.HighVal[0], rg.LowExclude, rg.HighExclude)
+		rangeVals := enumRangeValues(lowVal, highVal, rg.LowExclude, rg.HighExclude)
 		// The small range case.
 		if rangeVals != nil {
 			for _, val := range rangeVals {
@@ -765,25 +827,25 @@ func (c *Column) GetColumnRowCount(sc *stmtctx.StatementContext, ranges []*range
 			continue
 		}
 		// The interval case.
-		cnt := c.BetweenRowCount(rg.LowVal[0], rg.HighVal[0])
-		if (c.outOfRange(rg.LowVal[0]) && !rg.LowVal[0].IsNull()) || c.outOfRange(rg.HighVal[0]) {
+		cnt := c.BetweenRowCount(lowVal, highVal)
+		if (c.outOfRange(lowVal) && !lowVal.IsNull()) || c.outOfRange(highVal) {
 			cnt += float64(modifyCount) / outOfRangeBetweenRate
 		}
 		// `betweenRowCount` returns count for [l, h) range, we adjust cnt for boudaries here.
 		// Note that, `cnt` does not include null values, we need specially handle cases
 		// where null is the lower bound.
-		if rg.LowExclude && !rg.LowVal[0].IsNull() {
-			lowCnt, err := c.equalRowCount(sc, rg.LowVal[0], modifyCount)
+		if rg.LowExclude && !lowVal.IsNull() {
+			lowCnt, err := c.equalRowCount(sc, lowVal, modifyCount)
 			if err != nil {
 				return 0, errors.Trace(err)
 			}
 			cnt -= lowCnt
 		}
-		if !rg.LowExclude && rg.LowVal[0].IsNull() {
+		if !rg.LowExclude && lowVal.IsNull() {
 			cnt += float64(c.NullCount)
 		}
 		if !rg.HighExclude {
-			highCnt, err := c.equalRowCount(sc, rg.HighVal[0], modifyCount)
+			highCnt, err := c.equalRowCount(sc, highVal, modifyCount)
 			if err != nil {
 				return 0, errors.Trace(err)
 			}
@@ -1137,10 +1199,10 @@ func (hg *Histogram) ExtractTopN(cms *CMSketch, numCols int, numTopN uint32) err
 		}
 	}
 	sort.SliceStable(dataCnts, func(i, j int) bool { return dataCnts[i].cnt >= dataCnts[j].cnt })
-	cms.topN = make(map[uint64][]*TopNMeta)
 	if len(dataCnts) > int(numTopN) {
 		dataCnts = dataCnts[:numTopN]
 	}
+	cms.topN = make(map[uint64][]*TopNMeta, len(dataCnts))
 	for _, dataCnt := range dataCnts {
 		h1, h2 := murmur3.Sum128(dataCnt.data)
 		realCnt := cms.queryHashValue(h1, h2)

@@ -15,6 +15,7 @@ package kv
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/pingcap/tidb/config"
@@ -53,6 +54,8 @@ const (
 	SnapshotTS
 	// Set replica read
 	ReplicaRead
+	// Set task ID
+	TaskID
 )
 
 // Priority value for transaction priority.
@@ -93,28 +96,34 @@ const (
 	ReplicaReadLeader ReplicaReadType = 1 << iota
 	// ReplicaReadFollower stands for 'read from follower'.
 	ReplicaReadFollower
-	// ReplicaReadLearner stands for 'read from learner'.
-	ReplicaReadLearner
+	// ReplicaReadMixed stands for 'read from leader and follower and learner'.
+	ReplicaReadMixed
 )
 
 // IsFollowerRead checks if leader is going to be used to read data.
 func (r ReplicaReadType) IsFollowerRead() bool {
-	return r == ReplicaReadFollower
+	// In some cases the default value is 0, which should be treated as `ReplicaReadLeader`.
+	return r != ReplicaReadLeader && r != 0
 }
 
 // Those limits is enforced to make sure the transaction can be well handled by TiKV.
 var (
 	// TxnEntrySizeLimit is limit of single entry size (len(key) + len(value)).
-	TxnEntrySizeLimit = 6 * 1024 * 1024
+	TxnEntrySizeLimit uint64 = config.DefTxnEntrySizeLimit
 	// TxnTotalSizeLimit is limit of the sum of all entry size.
 	TxnTotalSizeLimit uint64 = config.DefTxnTotalSizeLimit
 )
 
-// Retriever is the interface wraps the basic Get and Seek methods.
-type Retriever interface {
+// Getter is the interface for the Get method.
+type Getter interface {
 	// Get gets the value for key k from kv store.
 	// If corresponding kv pair does not exist, it returns nil and ErrNotExist.
 	Get(ctx context.Context, k Key) ([]byte, error)
+}
+
+// Retriever is the interface wraps the basic Get and Seek methods.
+type Retriever interface {
+	Getter
 	// Iter creates an Iterator positioned on the first entry that k <= entry's key.
 	// If such entry is not found, it returns an invalid Iterator with no error.
 	// It yields only keys that < upperBound. If upperBound is nil, it means the upperBound is unbounded.
@@ -150,11 +159,17 @@ type MemBuffer interface {
 	Size() int
 	// Len returns the number of entries in the DB.
 	Len() int
-	// Reset cleanup the MemBuffer
-	Reset()
-	// SetCap sets the MemBuffer capability, to reduce memory allocations.
-	// Please call it before you use the MemBuffer, otherwise it will not works.
-	SetCap(cap int)
+	// NewStagingBuffer returns a new write buffer,
+	// modifications in the returned buffer will not influence this buffer
+	// until you call Flush, or you can use Discard to discard all of them.
+	//
+	// Note: you cannot modify this MemBuffer until the child buffer finished,
+	// otherwise the Set operation will panic.
+	NewStagingBuffer() MemBuffer
+	// Flush flushes all kvs in this buffer to parrent buffer.
+	Flush() (int, error)
+	// Discard discads all kvs in this buffer.
+	Discard()
 }
 
 // Transaction defines the interface for operations inside a Transaction.
@@ -168,7 +183,7 @@ type Transaction interface {
 	// String implements fmt.Stringer interface.
 	String() string
 	// LockKeys tries to lock the entries with the keys in KV store.
-	LockKeys(ctx context.Context, killed *uint32, forUpdateTS uint64, lockWaitTime int64, keys ...Key) error
+	LockKeys(ctx context.Context, lockCtx *LockCtx, keys ...Key) error
 	// SetOption sets an option with a value, when val is nil, uses the default
 	// value of this option.
 	SetOption(opt Option, val interface{})
@@ -183,13 +198,38 @@ type Transaction interface {
 	Valid() bool
 	// GetMemBuffer return the MemBuffer binding to this transaction.
 	GetMemBuffer() MemBuffer
+	// GetSnapshot returns the Snapshot binding to this transaction.
+	GetSnapshot() Snapshot
 	// SetVars sets variables to the transaction.
 	SetVars(vars *Variables)
+	// GetVars gets variables from the transaction.
+	GetVars() *Variables
 	// BatchGet gets kv from the memory buffer of statement and transaction, and the kv storage.
 	// Do not use len(value) == 0 or value == nil to represent non-exist.
 	// If a key doesn't exist, there shouldn't be any corresponding entry in the result map.
 	BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error)
 	IsPessimistic() bool
+}
+
+// LockCtx contains information for LockKeys method.
+type LockCtx struct {
+	Killed                *uint32
+	ForUpdateTS           uint64
+	LockWaitTime          int64
+	WaitStartTime         time.Time
+	PessimisticLockWaited *int32
+	LockKeysDuration      *time.Duration
+	LockKeysCount         *int32
+	ReturnValues          bool
+	Values                map[string]ReturnedValue
+	ValuesLock            sync.Mutex
+	LockExpired           *uint32
+}
+
+// ReturnedValue pairs the Value and AlreadyLocked flag for PessimisticLock return values result.
+type ReturnedValue struct {
+	Value         []byte
+	AlreadyLocked bool
 }
 
 // Client is used to send request to KV layer.
@@ -226,14 +266,22 @@ const (
 	TiKV StoreType = iota
 	// TiFlash means the type of a store is TiFlash.
 	TiFlash
+	// TiDB means the type of a store is TiDB.
+	TiDB
+	// UnSpecified means the store type is unknown
+	UnSpecified = 255
 )
 
 // Name returns the name of store type.
 func (t StoreType) Name() string {
 	if t == TiFlash {
 		return "tiflash"
+	} else if t == TiDB {
+		return "tidb"
+	} else if t == TiKV {
+		return "tikv"
 	}
-	return "tikv"
+	return "unspecified"
 }
 
 // Request represents a kv request.
@@ -252,7 +300,7 @@ type Request struct {
 	IsolationLevel IsoLevel
 	// Priority is the priority of this KV request, its value may be PriorityNormal/PriorityLow/PriorityHigh.
 	Priority int
-	// MemTracker is used to trace and control memory usage in co-processor layer.
+	// memTracker is used to trace and control memory usage in co-processor layer.
 	MemTracker *memory.Tracker
 	// KeepOrder is true, if the response should be returned in order.
 	KeepOrder bool
@@ -269,6 +317,14 @@ type Request struct {
 	ReplicaRead ReplicaReadType
 	// StoreType represents this request is sent to the which type of store.
 	StoreType StoreType
+	// Cacheable is true if the request can be cached. Currently only deterministic DAG requests can be cached.
+	Cacheable bool
+	// SchemaVer is for any schema-ful storage to validate schema correctness if necessary.
+	SchemaVar int64
+	// BatchCop indicates whether send batch coprocessor request to tiflash.
+	BatchCop bool
+	// TaskID is an unique ID for an execution of a statement
+	TaskID uint64
 }
 
 // ResultSubset represents a result subset from a single storage unit.
@@ -305,6 +361,12 @@ type Snapshot interface {
 	SetOption(opt Option, val interface{})
 	// DelOption deletes an option.
 	DelOption(opt Option)
+}
+
+// BatchGetter is the interface for BatchGet.
+type BatchGetter interface {
+	// BatchGet gets a batch of values.
+	BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error)
 }
 
 // Driver is the interface that must be implemented by a KV storage.
@@ -356,10 +418,10 @@ type Iterator interface {
 	Close()
 }
 
-// SplitableStore is the kv store which supports split regions.
-type SplitableStore interface {
+// SplittableStore is the kv store which supports split regions.
+type SplittableStore interface {
 	SplitRegions(ctx context.Context, splitKey [][]byte, scatter bool) (regionID []uint64, err error)
-	WaitScatterRegionFinish(regionID uint64, backOff int) error
+	WaitScatterRegionFinish(ctx context.Context, regionID uint64, backOff int) error
 	CheckRegionInScattering(regionID uint64) (bool, error)
 }
 

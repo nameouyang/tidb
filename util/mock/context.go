@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/kvcache"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/sqlexec"
@@ -61,6 +62,11 @@ func (c *Context) Execute(ctx context.Context, sql string) ([]sqlexec.RecordSet,
 	return nil, errors.Errorf("Not Support.")
 }
 
+// ExecuteInternal implements sqlexec.SQLExecutor ExecuteInternal interface.
+func (c *Context) ExecuteInternal(ctx context.Context, sql string) ([]sqlexec.RecordSet, error) {
+	return nil, errors.Errorf("Not Support.")
+}
+
 type mockDDLOwnerChecker struct{}
 
 func (c *mockDDLOwnerChecker) IsOwner() bool { return true }
@@ -84,6 +90,11 @@ func (c *Context) Value(key fmt.Stringer) interface{} {
 // ClearValue implements sessionctx.Context ClearValue interface.
 func (c *Context) ClearValue(key fmt.Stringer) {
 	delete(c.values, key)
+}
+
+// HasDirtyContent implements sessionctx.Context ClearValue interface.
+func (c *Context) HasDirtyContent(tid int64) bool {
+	return false
 }
 
 // GetSessionVars implements the sessionctx.Context GetSessionVars interface.
@@ -163,7 +174,6 @@ func (c *Context) InitTxnWithStartTS(startTS uint64) error {
 		if err != nil {
 			return errors.Trace(err)
 		}
-		txn.SetCap(kv.DefaultTxnMembufCap)
 		c.txn.Transaction = txn
 	}
 	return nil
@@ -198,7 +208,7 @@ func (c *Context) GoCtx() context.Context {
 func (c *Context) StoreQueryFeedback(_ interface{}) {}
 
 // StmtCommit implements the sessionctx.Context interface.
-func (c *Context) StmtCommit() error {
+func (c *Context) StmtCommit(tracker *memory.Tracker) error {
 	return nil
 }
 
@@ -212,7 +222,7 @@ func (c *Context) StmtGetMutation(tableID int64) *binlog.TableMutation {
 }
 
 // StmtAddDirtyTableOP implements the sessionctx.Context interface.
-func (c *Context) StmtAddDirtyTableOP(op int, tid int64, handle int64) {
+func (c *Context) StmtAddDirtyTableOP(op int, tid int64, handle kv.Handle) {
 }
 
 // AddTableLock implements the sessionctx.Context interface.
@@ -246,8 +256,8 @@ func (c *Context) HasLockedTables() bool {
 	return false
 }
 
-// PrepareTxnFuture implements the sessionctx.Context interface.
-func (c *Context) PrepareTxnFuture(ctx context.Context) {
+// PrepareTSFuture implements the sessionctx.Context interface.
+func (c *Context) PrepareTSFuture(ctx context.Context) {
 }
 
 // Close implements the sessionctx.Context interface.
@@ -267,6 +277,7 @@ func NewContext() *Context {
 	sctx.sessionVars.MaxChunkSize = 32
 	sctx.sessionVars.StmtCtx.TimeZone = time.UTC
 	sctx.sessionVars.StmtCtx.MemTracker = memory.NewTracker(stringutil.StringerStr("mock.NewContext"), -1)
+	sctx.sessionVars.StmtCtx.DiskTracker = disk.NewTracker(stringutil.StringerStr("mock.NewContext"), -1)
 	sctx.sessionVars.GlobalVarsAccessor = variable.NewMockGlobalAccessor()
 	if err := sctx.GetSessionVars().SetSystemVar(variable.MaxAllowedPacket, "67108864"); err != nil {
 		panic(err)

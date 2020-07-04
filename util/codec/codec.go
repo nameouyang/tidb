@@ -29,6 +29,8 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
+	"github.com/pingcap/tidb/util/hack"
 )
 
 // First byte in the encoded value which specifies the encoding type.
@@ -88,7 +90,9 @@ func encode(sc *stmtctx.StatementContext, b []byte, vals []types.Datum, comparab
 		case types.KindFloat32, types.KindFloat64:
 			b = append(b, floatFlag)
 			b = EncodeFloat(b, vals[i].GetFloat64())
-		case types.KindString, types.KindBytes:
+		case types.KindString:
+			b = encodeString(b, vals[i], comparable)
+		case types.KindBytes:
 			b = encodeBytes(b, vals[i].GetBytes(), comparable)
 		case types.KindMysqlTime:
 			b = append(b, uintFlag)
@@ -174,7 +178,7 @@ func EncodeMySQLTime(sc *stmtctx.StatementContext, t types.Time, tp byte, b []by
 	// Encoding timestamp need to consider timezone. If it's not in UTC, transform to UTC first.
 	// This is compatible with `PBToExpr > convertTime`, and coprocessor assumes the passed timestamp is in UTC as well.
 	if tp == mysql.TypeUnspecified {
-		tp = t.Type
+		tp = t.Type()
 	}
 	if tp == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
 		err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
@@ -189,6 +193,13 @@ func EncodeMySQLTime(sc *stmtctx.StatementContext, t types.Time, tp byte, b []by
 	}
 	b = EncodeUint(b, v)
 	return b, nil
+}
+
+func encodeString(b []byte, val types.Datum, comparable bool) []byte {
+	if collate.NewCollationEnabled() && comparable {
+		return encodeBytes(b, collate.GetCollator(val.Collation()).Key(val.GetString()), true)
+	}
+	return encodeBytes(b, val.GetBytes(), comparable)
 }
 
 func encodeBytes(b []byte, v []byte, comparable bool) []byte {
@@ -299,19 +310,31 @@ func encodeHashChunkRowIdx(sc *stmtctx.StatementContext, row chunk.Row, tp *type
 	case mysql.TypeFloat:
 		flag = floatFlag
 		f := float64(row.GetFloat32(idx))
+		// For negative zero. In memory, 0 is [0, 0, 0, 0, 0, 0, 0, 0] and -0 is [0, 0, 0, 0, 0, 0, 0, 128].
+		// It makes -0's hash val different from 0's.
+		if f == 0 {
+			f = 0
+		}
 		b = (*[unsafe.Sizeof(f)]byte)(unsafe.Pointer(&f))[:]
 	case mysql.TypeDouble:
 		flag = floatFlag
-		b = row.GetRaw(idx)
+		f := row.GetFloat64(idx)
+		// For negative zero. In memory, 0 is [0, 0, 0, 0, 0, 0, 0, 0] and -0 is [0, 0, 0, 0, 0, 0, 0, 128].
+		// It makes -0's hash val different from 0's.
+		if f == 0 {
+			f = 0
+		}
+		b = (*[unsafe.Sizeof(f)]byte)(unsafe.Pointer(&f))[:]
 	case mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeString, mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
 		flag = compactBytesFlag
 		b = row.GetBytes(idx)
+		b = ConvertByCollation(b, tp)
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
 		flag = uintFlag
 		t := row.GetTime(idx)
 		// Encoding timestamp need to consider timezone.
 		// If it's not in UTC, transform to UTC first.
-		if t.Type == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
+		if t.Type() == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
 			err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
 			if err != nil {
 				return
@@ -405,6 +428,11 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 			} else {
 				buf[0] = floatFlag
 				d := float64(f)
+				// For negative zero. In memory, 0 is [0, 0, 0, 0, 0, 0, 0, 0] and -0 is [0, 0, 0, 0, 0, 0, 0, 128].
+				// It makes -0's hash val different from 0's.
+				if d == 0 {
+					d = 0
+				}
 				b = (*[sizeFloat64]byte)(unsafe.Pointer(&d))[:]
 			}
 
@@ -424,6 +452,11 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 				isNull[i] = true
 			} else {
 				buf[0] = floatFlag
+				// For negative zero. In memory, 0 is [0, 0, 0, 0, 0, 0, 0, 0] and -0 is [0, 0, 0, 0, 0, 0, 0, 128].
+				// It makes -0's hash val different from 0's.
+				if f == 0 {
+					f = 0
+				}
 				b = (*[sizeFloat64]byte)(unsafe.Pointer(&f))[:]
 			}
 
@@ -443,6 +476,7 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 			} else {
 				buf[0] = compactBytesFlag
 				b = column.GetBytes(i)
+				b = ConvertByCollation(b, tp)
 			}
 
 			// As the golang doc described, `Hash.Write` never returns an error.
@@ -463,7 +497,7 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 				buf[0] = uintFlag
 				// Encoding timestamp need to consider timezone.
 				// If it's not in UTC, transform to UTC first.
-				if t.Type == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
+				if t.Type() == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
 					err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
 					if err != nil {
 						return
@@ -600,6 +634,15 @@ func HashChunkSelected(sc *stmtctx.StatementContext, h []hash.Hash64, chk *chunk
 			// See https://golang.org/pkg/hash/#Hash
 			_, _ = h[i].Write(buf)
 			_, _ = h[i].Write(b)
+		}
+	case mysql.TypeNull:
+		for i := 0; i < rows; i++ {
+			if sel != nil && !sel[i] {
+				continue
+			}
+			isNull[i] = true
+			buf[0] = NilFlag
+			_, _ = h[i].Write(buf)
 		}
 	default:
 		return errors.Errorf("unsupport column type for encode %d", tp.Tp)
@@ -767,7 +810,7 @@ func DecodeOne(b []byte) (remain []byte, d types.Datum, err error) {
 		if err == nil {
 			// use max fsp, let outer to do round manually.
 			v := types.Duration{Duration: time.Duration(r), Fsp: types.MaxFsp}
-			d.SetValue(v)
+			d.SetMysqlDuration(v)
 		}
 	case jsonFlag:
 		var size int
@@ -984,9 +1027,18 @@ func (decoder *Decoder) DecodeOne(b []byte, colIdx int, ft *types.FieldType) (re
 		chk.AppendBytes(colIdx, v)
 	case decimalFlag:
 		var dec *types.MyDecimal
-		b, dec, _, _, err = DecodeDecimal(b)
+		var frac int
+		b, dec, _, frac, err = DecodeDecimal(b)
 		if err != nil {
 			return nil, errors.Trace(err)
+		}
+		if ft.Decimal != types.UnspecifiedLength && frac > ft.Decimal {
+			to := new(types.MyDecimal)
+			err := dec.Round(to, ft.Decimal, types.ModeHalfEven)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			dec = to
 		}
 		chk.AppendMyDecimal(colIdx, dec)
 	case durationFlag:
@@ -1029,9 +1081,7 @@ func appendIntToChunk(val int64, chk *chunk.Chunk, colIdx int, ft *types.FieldTy
 func appendUintToChunk(val uint64, chk *chunk.Chunk, colIdx int, ft *types.FieldType, loc *time.Location) error {
 	switch ft.Tp {
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
-		var t types.Time
-		t.Type = ft.Tp
-		t.Fsp = int8(ft.Decimal)
+		t := types.NewTime(types.ZeroCoreTime, ft.Tp, int8(ft.Decimal))
 		var err error
 		err = t.FromPackedUint(val)
 		if err != nil {
@@ -1155,11 +1205,23 @@ func HashGroupKey(sc *stmtctx.StatementContext, n int, col *chunk.Column, buf []
 			if col.IsNull(i) {
 				buf[i] = append(buf[i], NilFlag)
 			} else {
-				buf[i] = encodeBytes(buf[i], col.GetBytes(i), false)
+				buf[i] = encodeBytes(buf[i], ConvertByCollation(col.GetBytes(i), ft), false)
 			}
 		}
 	default:
 		return nil, errors.New(fmt.Sprintf("invalid eval type %v", ft.EvalType()))
 	}
 	return buf, nil
+}
+
+// ConvertByCollation converts these bytes according to its collation.
+func ConvertByCollation(raw []byte, tp *types.FieldType) []byte {
+	collator := collate.GetCollator(tp.Collate)
+	return collator.Key(string(hack.String(raw)))
+}
+
+// ConvertByCollationStr converts this string according to its collation.
+func ConvertByCollationStr(str string, tp *types.FieldType) string {
+	collator := collate.GetCollator(tp.Collate)
+	return string(hack.String(collator.Key(str)))
 }

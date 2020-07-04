@@ -1,5 +1,11 @@
 [
   {
+    "name": "TestUniqCompEqualEst",
+    "cases": [
+      "explain select * from t where a = 1 and b = 5 and 1 = 1"
+    ]
+  },
+  {
     "name": "TestColumnIndexNullEstimation",
     "cases": [
       "explain select b from t where b is null",
@@ -37,6 +43,14 @@
     "name": "TestSelectCombinedLowBound",
     "cases": [
       "explain select * from t where kid = 1"
+    ]
+  },
+  {
+    "name": "TestCollationColumnEstimate",
+    "cases": [
+      "show stats_buckets",
+      "explain select * from t where a='aÄa'",
+      "explain select * from t where a > 'aÄa'"
     ]
   }
 ]

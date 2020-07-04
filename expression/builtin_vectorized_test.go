@@ -84,7 +84,10 @@ func genMockVecPlusIntBuiltinFunc() (*mockVecPlusIntBuiltinFunc, *chunk.Chunk, *
 	col1.Index, col1.RetType = 0, tp
 	col2 := newColumn(1)
 	col2.Index, col2.RetType = 1, tp
-	bf := newBaseBuiltinFuncWithTp(mock.NewContext(), []Expression{col1, col2}, types.ETInt, types.ETInt, types.ETInt)
+	bf, err := newBaseBuiltinFuncWithTp(mock.NewContext(), "", []Expression{col1, col2}, types.ETInt, types.ETInt, types.ETInt)
+	if err != nil {
+		panic(err)
+	}
 	plus := &mockVecPlusIntBuiltinFunc{bf, nil, false}
 	input := chunk.New([]*types.FieldType{tp, tp}, 1024, 1024)
 	buf := chunk.NewColumn(types.NewFieldType(mysql.TypeLonglong), 1024)
@@ -112,7 +115,7 @@ func (s *testEvaluatorSuite) TestMockVecPlusInt(c *C) {
 	}
 }
 
-func (s *testEvaluatorSuite) TestMockVecPlusIntParallel(c *C) {
+func (s *testVectorizeSuite2) TestMockVecPlusIntParallel(c *C) {
 	plus, input, buf := genMockVecPlusIntBuiltinFunc()
 	plus.enableAlloc = true // it's concurrency-safe if enableAlloc is true
 	var wg sync.WaitGroup
@@ -332,11 +335,11 @@ func (p *mockBuiltinDouble) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, 
 func (p *mockBuiltinDouble) evalTime(row chunk.Row) (types.Time, bool, error) {
 	v, isNull, err := p.args[0].EvalTime(p.ctx, row)
 	if err != nil {
-		return types.Time{}, false, err
+		return types.ZeroTime, false, err
 	}
 	d, err := v.ConvertToDuration()
 	if err != nil {
-		return types.Time{}, false, err
+		return types.ZeroTime, false, err
 	}
 	v, err = v.Add(p.ctx.GetSessionVars().StmtCtx, d)
 	return v, isNull, err
@@ -399,7 +402,10 @@ func genMockRowDouble(eType types.EvalType, enableVec bool) (builtinFunc, *chunk
 	col1 := newColumn(1)
 	col1.Index = 0
 	col1.RetType = tp
-	bf := newBaseBuiltinFuncWithTp(mock.NewContext(), []Expression{col1}, eType, eType)
+	bf, err := newBaseBuiltinFuncWithTp(mock.NewContext(), "", []Expression{col1}, eType, eType)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	rowDouble := &mockBuiltinDouble{bf, eType, enableVec}
 	input := chunk.New([]*types.FieldType{tp}, 1024, 1024)
 	buf := chunk.NewColumn(types.NewFieldType(convertETType(eType)), 1024)
@@ -427,7 +433,7 @@ func genMockRowDouble(eType types.EvalType, enableVec bool) (builtinFunc, *chunk
 			input.AppendString(0, fmt.Sprintf("%v", i))
 		case types.ETDatetime:
 			t := types.FromDate(i, 0, 0, 0, 0, 0, 0)
-			input.AppendTime(0, types.Time{Time: t, Type: mysqlType})
+			input.AppendTime(0, types.NewTime(t, mysqlType, 0))
 		}
 	}
 	return rowDouble, input, buf, nil
@@ -473,7 +479,7 @@ func (s *testEvaluatorSuite) checkVecEval(c *C, eType types.EvalType, sel []int,
 		c.Assert(len(ds), Equals, len(sel))
 		for i, j := range sel {
 			gt := types.FromDate(j, 0, 0, 0, 0, 0, 0)
-			t := types.Time{Time: gt, Type: convertETType(eType)}
+			t := types.NewTime(gt, convertETType(eType), 0)
 			d, err := t.ConvertToDuration()
 			c.Assert(err, IsNil)
 			v, err := t.Add(mock.NewContext().GetSessionVars().StmtCtx, d)

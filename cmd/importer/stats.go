@@ -83,7 +83,7 @@ func getValidPrefix(lower, upper string) string {
 			randCh := uint8(rand.Intn(int(upper[i]-lower[i]))) + lower[i]
 			newBytes := make([]byte, i, i+1)
 			copy(newBytes, lower[:i])
-			newBytes = append(newBytes, byte(randCh))
+			newBytes = append(newBytes, randCh)
 			return string(newBytes)
 		}
 	}
@@ -136,7 +136,7 @@ func (h *histogram) randDate(unit string, mysqlFmt string, dateFmt string) strin
 			return str
 		}
 		delta := randInt(0, int(diff)-1)
-		l, err := lower.Time.GoTime(time.Local)
+		l, err := lower.GoTime(time.Local)
 		if err != nil {
 			log.Fatal(err.Error())
 		}

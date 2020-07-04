@@ -18,6 +18,8 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/store/mockstore"
@@ -41,7 +43,7 @@ type testSuite struct {
 func (s *testSuite) SetUpSuite(c *C) {
 	testleak.BeforeTest()
 	var err error
-	s.store, err = mockstore.NewMockTikvStore()
+	s.store, err = mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	s.ctx = mock.NewContext()
 	s.ctx.Store = s.store
@@ -79,7 +81,7 @@ func (s *testSuite) TestGetDDLInfo(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(info.Jobs, HasLen, 1)
 	c.Assert(info.Jobs[0], DeepEquals, job)
-	c.Assert(info.ReorgHandle, Equals, int64(0))
+	c.Assert(info.ReorgHandle, Equals, nil)
 	// Two jobs.
 	t = meta.NewMeta(txn, meta.AddIndexJobListKey)
 	err = t.EnQueueDDLJob(job1)
@@ -89,7 +91,7 @@ func (s *testSuite) TestGetDDLInfo(c *C) {
 	c.Assert(info.Jobs, HasLen, 2)
 	c.Assert(info.Jobs[0], DeepEquals, job)
 	c.Assert(info.Jobs[1], DeepEquals, job1)
-	c.Assert(info.ReorgHandle, Equals, int64(0))
+	c.Assert(info.ReorgHandle, Equals, nil)
 	err = txn.Rollback()
 	c.Assert(err, IsNil)
 }
@@ -100,6 +102,7 @@ func (s *testSuite) TestGetDDLJobs(c *C) {
 	t := meta.NewMeta(txn)
 	cnt := 10
 	jobs := make([]*model.Job, cnt)
+	var currJobs2 []*model.Job
 	for i := 0; i < cnt; i++ {
 		jobs[i] = &model.Job{
 			ID:       int64(i),
@@ -111,6 +114,19 @@ func (s *testSuite) TestGetDDLJobs(c *C) {
 		currJobs, err1 := GetDDLJobs(txn)
 		c.Assert(err1, IsNil)
 		c.Assert(currJobs, HasLen, i+1)
+		currJobs2 = currJobs2[:0]
+		err = IterAllDDLJobs(txn, func(jobs []*model.Job) (b bool, e error) {
+			for _, job := range jobs {
+				if job.State == model.JobStateNone {
+					currJobs2 = append(currJobs2, job)
+				} else {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+		c.Assert(err, IsNil)
+		c.Assert(currJobs2, HasLen, i+1)
 	}
 
 	currJobs, err := GetDDLJobs(txn)
@@ -120,6 +136,7 @@ func (s *testSuite) TestGetDDLJobs(c *C) {
 		c.Assert(job.SchemaID, Equals, int64(1))
 		c.Assert(job.Type, Equals, model.ActionCreateTable)
 	}
+	c.Assert(currJobs, DeepEquals, currJobs2)
 
 	err = txn.Rollback()
 	c.Assert(err, IsNil)
@@ -232,7 +249,7 @@ func (s *testSuite) TestCancelJobs(c *C) {
 
 	// test can't cancelable job.
 	job.Type = model.ActionDropIndex
-	job.SchemaState = model.StateDeleteOnly
+	job.SchemaState = model.StateWriteOnly
 	job.State = model.JobStateRunning
 	job.ID = 101
 	err = t.EnQueueDDLJob(job)
@@ -262,13 +279,21 @@ func (s *testSuite) TestCancelJobs(c *C) {
 		TableID:  2,
 		Type:     model.ActionAddIndex,
 	}
+	job3 := &model.Job{
+		ID:       1003,
+		SchemaID: 1,
+		TableID:  2,
+		Type:     model.ActionRepairTable,
+	}
 	err = t.EnQueueDDLJob(job, meta.AddIndexJobListKey)
 	c.Assert(err, IsNil)
 	err = t.EnQueueDDLJob(job1)
 	c.Assert(err, IsNil)
 	err = t.EnQueueDDLJob(job2, meta.AddIndexJobListKey)
 	c.Assert(err, IsNil)
-	errs, err = CancelJobs(txn, []int64{job1.ID, job.ID, job2.ID})
+	err = t.EnQueueDDLJob(job3)
+	c.Assert(err, IsNil)
+	errs, err = CancelJobs(txn, []int64{job1.ID, job.ID, job2.ID, job3.ID})
 	c.Assert(err, IsNil)
 	for _, err := range errs {
 		c.Assert(err, IsNil)
@@ -312,6 +337,19 @@ func (s *testSuite) TestGetHistoryDDLJobs(c *C) {
 		c.Assert(job.Type, Equals, model.ActionCreateTable)
 	}
 
+	var historyJobs2 []*model.Job
+	err = IterHistoryDDLJobs(txn, func(jobs []*model.Job) (b bool, e error) {
+		for _, job := range jobs {
+			historyJobs2 = append(historyJobs2, job)
+			if len(historyJobs2) == DefNumHistoryJobs {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	c.Assert(err, IsNil)
+	c.Assert(historyJobs2, DeepEquals, historyJobs)
+
 	err = txn.Rollback()
 	c.Assert(err, IsNil)
 }
@@ -326,6 +364,7 @@ func (s *testSuite) TestIsJobRollbackable(c *C) {
 		{model.ActionDropIndex, model.StateDeleteOnly, false},
 		{model.ActionDropSchema, model.StateDeleteOnly, false},
 		{model.ActionDropColumn, model.StateDeleteOnly, false},
+		{model.ActionDropColumns, model.StateDeleteOnly, false},
 	}
 	job := &model.Job{}
 	for _, ca := range cases {
@@ -333,5 +372,18 @@ func (s *testSuite) TestIsJobRollbackable(c *C) {
 		job.SchemaState = ca.state
 		re := IsJobRollbackable(job)
 		c.Assert(re == ca.result, IsTrue)
+	}
+}
+
+func (s *testSuite) TestError(c *C) {
+	kvErrs := []*terror.Error{
+		ErrDataInConsistent,
+		ErrDDLJobNotFound,
+		ErrCancelFinishedDDLJob,
+		ErrCannotCancelDDLJob,
+	}
+	for _, err := range kvErrs {
+		code := err.ToSQLError().Code
+		c.Assert(code != mysql.ErrUnknown && code == uint16(err.Code()), IsTrue, Commentf("err: %v", err))
 	}
 }

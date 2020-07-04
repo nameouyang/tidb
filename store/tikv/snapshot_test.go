@@ -16,6 +16,7 @@ package tikv
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	. "github.com/pingcap/check"
@@ -119,6 +120,8 @@ func (s *testSnapshotSuite) TestBatchGet(c *C) {
 	}
 }
 
+type contextKey string
+
 func (s *testSnapshotSuite) TestSnapshotCache(c *C) {
 	txn := s.beginTxn(c)
 	c.Assert(txn.Set(kv.Key("x"), []byte("x")), IsNil)
@@ -131,7 +134,7 @@ func (s *testSnapshotSuite) TestSnapshotCache(c *C) {
 	c.Assert(err, IsNil)
 
 	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tikv/snapshot-get-cache-fail", `return(true)`), IsNil)
-	ctx := context.WithValue(context.Background(), "TestSnapshotCache", true)
+	ctx := context.WithValue(context.Background(), contextKey("TestSnapshotCache"), true)
 	_, err = snapshot.Get(ctx, kv.Key("x"))
 	c.Assert(err, IsNil)
 
@@ -209,30 +212,91 @@ func (s *testSnapshotSuite) TestLockNotFoundPrint(c *C) {
 }
 
 func (s *testSnapshotSuite) TestSkipLargeTxnLock(c *C) {
+	x := kv.Key("x_key_TestSkipLargeTxnLock")
+	y := kv.Key("y_key_TestSkipLargeTxnLock")
 	txn := s.beginTxn(c)
-	c.Assert(txn.Set(kv.Key("x"), []byte("x")), IsNil)
-	c.Assert(txn.Set(kv.Key("y"), []byte("y")), IsNil)
+	c.Assert(txn.Set(x, []byte("x")), IsNil)
+	c.Assert(txn.Set(y, []byte("y")), IsNil)
 	ctx := context.Background()
 	bo := NewBackoffer(ctx, PrewriteMaxBackoff)
 	committer, err := newTwoPhaseCommitterWithInit(txn, 0)
 	c.Assert(err, IsNil)
-	committer.lockTTL = txnLockTTL(txn.startTime, 10<<20)
-	c.Assert(committer.prewriteKeys(bo, committer.keys), IsNil)
+	committer.lockTTL = 3000
+	c.Assert(committer.prewriteMutations(bo, committer.mutations), IsNil)
 
 	txn1 := s.beginTxn(c)
 	// txn1 is not blocked by txn in the large txn protocol.
-	_, err = txn1.Get(ctx, kv.Key("x"))
+	_, err = txn1.Get(ctx, x)
 	c.Assert(kv.IsErrNotFound(errors.Trace(err)), IsTrue)
 
-	res, err := txn1.BatchGet(ctx, []kv.Key{kv.Key("x"), kv.Key("y"), kv.Key("z")})
+	res, err := txn1.BatchGet(ctx, []kv.Key{x, y, kv.Key("z")})
 	c.Assert(err, IsNil)
 	c.Assert(res, HasLen, 0)
 
 	// Commit txn, check the final commit ts is pushed.
 	committer.commitTS = txn.StartTS() + 1
-	c.Assert(committer.commitKeys(bo, committer.keys), IsNil)
-	status, err := s.store.lockResolver.GetTxnStatus(txn.StartTS(), 0, []byte("x"))
+	c.Assert(committer.commitMutations(bo, committer.mutations), IsNil)
+	status, err := s.store.lockResolver.GetTxnStatus(txn.StartTS(), 0, x)
 	c.Assert(err, IsNil)
 	c.Assert(status.IsCommitted(), IsTrue)
 	c.Assert(status.CommitTS(), Greater, txn1.StartTS())
+}
+
+func (s *testSnapshotSuite) TestPointGetSkipTxnLock(c *C) {
+	x := kv.Key("x_key_TestPointGetSkipTxnLock")
+	y := kv.Key("y_key_TestPointGetSkipTxnLock")
+	txn := s.beginTxn(c)
+	c.Assert(txn.Set(x, []byte("x")), IsNil)
+	c.Assert(txn.Set(y, []byte("y")), IsNil)
+	ctx := context.Background()
+	bo := NewBackoffer(ctx, PrewriteMaxBackoff)
+	committer, err := newTwoPhaseCommitterWithInit(txn, 0)
+	c.Assert(err, IsNil)
+	committer.lockTTL = 3000
+	c.Assert(committer.prewriteMutations(bo, committer.mutations), IsNil)
+
+	snapshot := newTiKVSnapshot(s.store, kv.MaxVersion, 0)
+	start := time.Now()
+	c.Assert(committer.primary(), BytesEquals, []byte(x))
+	// Point get secondary key. Shouldn't be blocked by the lock and read old data.
+	_, err = snapshot.Get(ctx, y)
+	c.Assert(kv.IsErrNotFound(errors.Trace(err)), IsTrue)
+	c.Assert(time.Since(start), Less, 500*time.Millisecond)
+
+	// Commit the primary key
+	committer.commitTS = txn.StartTS() + 1
+	committer.commitMutations(bo, committer.mutationsOfKeys([][]byte{committer.primary()}))
+
+	snapshot = newTiKVSnapshot(s.store, kv.MaxVersion, 0)
+	start = time.Now()
+	// Point get secondary key. Should read committed data.
+	value, err := snapshot.Get(ctx, y)
+	c.Assert(err, IsNil)
+	c.Assert(value, BytesEquals, []byte("y"))
+	c.Assert(time.Since(start), Less, 500*time.Millisecond)
+}
+
+func (s *testSnapshotSuite) TestSnapshotThreadSafe(c *C) {
+	txn := s.beginTxn(c)
+	key := kv.Key("key_test_snapshot_threadsafe")
+	c.Assert(txn.Set(key, []byte("x")), IsNil)
+	ctx := context.Background()
+	err := txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+
+	snapshot := newTiKVSnapshot(s.store, kv.MaxVersion, 0)
+	var wg sync.WaitGroup
+	wg.Add(5)
+	for i := 0; i < 5; i++ {
+		go func() {
+			for i := 0; i < 30; i++ {
+				_, err := snapshot.Get(ctx, key)
+				c.Assert(err, IsNil)
+				_, err = snapshot.BatchGet(ctx, []kv.Key{key, kv.Key("key_not_exist")})
+				c.Assert(err, IsNil)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }

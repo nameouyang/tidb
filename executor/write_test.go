@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/model"
@@ -38,7 +39,7 @@ type testBypassSuite struct{}
 func (s *testBypassSuite) SetUpSuite(c *C) {
 }
 
-func (s *testSuite4) TestInsert(c *C) {
+func (s *testSuite) TestInsert(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	testSQL := `drop table if exists insert_test;create table insert_test (id int PRIMARY KEY AUTO_INCREMENT, c1 int, c2 int, c3 int default 1);`
@@ -261,13 +262,13 @@ func (s *testSuite4) TestInsert(c *C) {
 	// issue 6424
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t(a time(6))")
-	tk.MustExec("insert into t value('20070219173709.055870'), ('20070219173709.055'), ('-20070219173709.055870'), ('20070219173709.055870123')")
-	tk.MustQuery("select * from t").Check(testkit.Rows("17:37:09.055870", "17:37:09.055000", "17:37:09.055870", "17:37:09.055870"))
+	tk.MustExec("insert into t value('20070219173709.055870'), ('20070219173709.055'), ('20070219173709.055870123')")
+	tk.MustQuery("select * from t").Check(testkit.Rows("17:37:09.055870", "17:37:09.055000", "17:37:09.055870"))
 	tk.MustExec("truncate table t")
 	tk.MustExec("insert into t value(20070219173709.055870), (20070219173709.055), (20070219173709.055870123)")
 	tk.MustQuery("select * from t").Check(testkit.Rows("17:37:09.055870", "17:37:09.055000", "17:37:09.055870"))
 	_, err = tk.Exec("insert into t value(-20070219173709.055870)")
-	c.Assert(err.Error(), Equals, "[types:1525]Incorrect time value: '-20070219173709.055870'")
+	c.Assert(err.Error(), Equals, "[table:1366]Incorrect time value: '-20070219173709.055870' for column 'a' at row 1")
 
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("set @@sql_mode=''")
@@ -299,6 +300,13 @@ func (s *testSuite4) TestInsert(c *C) {
 	_, err = tk.Exec("replace into v values(1,2)")
 	c.Assert(err.Error(), Equals, "replace into view v is not supported now.")
 	tk.MustExec("drop view v")
+
+	tk.MustExec("create sequence seq")
+	_, err = tk.Exec("insert into seq values()")
+	c.Assert(err.Error(), Equals, "insert into sequence seq is not supported now.")
+	_, err = tk.Exec("replace into seq values()")
+	c.Assert(err.Error(), Equals, "replace into sequence seq is not supported now.")
+	tk.MustExec("drop sequence seq")
 }
 
 func (s *testSuiteP2) TestMultiBatch(c *C) {
@@ -560,7 +568,7 @@ commit;`
 	tk.MustQuery(testSQL).Check(testkit.Rows("0"))
 }
 
-func (s *testSuite4) TestInsertOnDup(c *C) {
+func (s *testSuite8) TestInsertOnDup(c *C) {
 	var cfg kv.InjectionConfig
 	tk := testkit.NewTestKit(c, kv.NewInjectedStore(s.store, &cfg))
 	tk.MustExec("use test")
@@ -1502,13 +1510,18 @@ func (s *testSuite8) TestUpdate(c *C) {
 	tk.MustExec("update t set a = ''")
 	tk.MustQuery("select * from t").Check(testkit.Rows("0000-00-00 00:00:00 1999-12-13 00:00:00"))
 	tk.MustExec("update t set b = ''")
-	tk.MustQuery("select * from t").Check(testkit.Rows("0000-00-00 00:00:00 <nil>"))
+	tk.MustQuery("select * from t").Check(testkit.Rows("0000-00-00 00:00:00 0000-00-00 00:00:00"))
 	tk.MustExec("set @@sql_mode=@orig_sql_mode;")
 
 	tk.MustExec("create view v as select * from t")
 	_, err = tk.Exec("update v set a = '2000-11-11'")
 	c.Assert(err.Error(), Equals, core.ErrViewInvalid.GenWithStackByArgs("test", "v").Error())
 	tk.MustExec("drop view v")
+
+	tk.MustExec("create sequence seq")
+	_, err = tk.Exec("update seq set minvalue=1")
+	c.Assert(err.Error(), Equals, "update sequence seq is not supported now.")
+	tk.MustExec("drop sequence seq")
 
 	tk.MustExec("drop table if exists t1, t2")
 	tk.MustExec("create table t1(a int, b int, c int, d int, e int, index idx(a))")
@@ -1810,6 +1823,11 @@ func (s *testSuite) TestDelete(c *C) {
 	_, err = tk.Exec("delete from v where name = 'aaa'")
 	c.Assert(err.Error(), Equals, core.ErrViewInvalid.GenWithStackByArgs("test", "v").Error())
 	tk.MustExec("drop view v")
+
+	tk.MustExec("create sequence seq")
+	_, err = tk.Exec("delete from seq")
+	c.Assert(err.Error(), Equals, "delete sequence seq is not supported now.")
+	tk.MustExec("drop sequence seq")
 }
 
 func (s *testSuite4) TestPartitionedTableDelete(c *C) {
@@ -1931,7 +1949,7 @@ func (s *testSuite4) TestQualifiedDelete(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (s *testSuite4) TestLoadDataMissingColumn(c *C) {
+func (s *testSuite8) TestLoadDataMissingColumn(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	createSQL := `create table load_data_missing (id int, t timestamp not null)`
@@ -1944,7 +1962,7 @@ func (s *testSuite4) TestLoadDataMissingColumn(c *C) {
 	c.Assert(ld, NotNil)
 
 	deleteSQL := "delete from load_data_missing"
-	selectSQL := "select * from load_data_missing;"
+	selectSQL := "select id, hour(t), minute(t) from load_data_missing;"
 	_, reachLimit, err := ld.InsertData(context.Background(), nil, nil)
 	c.Assert(err, IsNil)
 	c.Assert(reachLimit, IsFalse)
@@ -1952,17 +1970,20 @@ func (s *testSuite4) TestLoadDataMissingColumn(c *C) {
 	r.Check(nil)
 
 	curTime := types.CurrentTime(mysql.TypeTimestamp)
-	timeStr := curTime.String()
+	timeHour := curTime.Hour()
+	timeMinute := curTime.Minute()
 	tests := []testCase{
-		{nil, []byte("12\n"), []string{fmt.Sprintf("12|%v", timeStr)}, nil, "Records: 1  Deleted: 0  Skipped: 0  Warnings: 0"},
+		{nil, []byte("12\n"), []string{fmt.Sprintf("12|%v|%v", timeHour, timeMinute)}, nil, "Records: 1  Deleted: 0  Skipped: 0  Warnings: 0"},
 	}
 	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 
 	tk.MustExec("alter table load_data_missing add column t2 timestamp null")
 	curTime = types.CurrentTime(mysql.TypeTimestamp)
-	timeStr = curTime.String()
+	timeHour = curTime.Hour()
+	timeMinute = curTime.Minute()
+	selectSQL = "select id, hour(t), minute(t), t2 from load_data_missing;"
 	tests = []testCase{
-		{nil, []byte("12\n"), []string{fmt.Sprintf("12|%v|<nil>", timeStr)}, nil, "Records: 1  Deleted: 0  Skipped: 0  Warnings: 0"},
+		{nil, []byte("12\n"), []string{fmt.Sprintf("12|%v|%v|<nil>", timeHour, timeMinute)}, nil, "Records: 1  Deleted: 0  Skipped: 0  Warnings: 0"},
 	}
 	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 
@@ -2161,6 +2182,7 @@ func (s *testSuite4) TestLoadDataEscape(c *C) {
 		{nil, []byte("6\t\\r\\t\\n\\0\\Z\\b\n"), []string{"6|" + string([]byte{'\r', '\t', '\n', 0, 26, '\b'})}, nil, trivialMsg},
 		{nil, []byte("7\trtn0ZbN\n"), []string{"7|" + string([]byte{'r', 't', 'n', '0', 'Z', 'b', 'N'})}, nil, trivialMsg},
 		{nil, []byte("8\trtn0Zb\\N\n"), []string{"8|" + string([]byte{'r', 't', 'n', '0', 'Z', 'b', 'N'})}, nil, trivialMsg},
+		{nil, []byte("9\ttab\\	tab\n"), []string{"9|tab	tab"}, nil, trivialMsg},
 	}
 	deleteSQL := "delete from load_data_test"
 	selectSQL := "select * from load_data_test;"
@@ -2252,7 +2274,7 @@ func (s *testSuite4) TestLoadDataIntoPartitionedTable(c *C) {
 	c.Assert(err, IsNil)
 	ld.SetMaxRowsInBatch(20000)
 	ld.SetMessage()
-	err = ctx.StmtCommit()
+	err = ctx.StmtCommit(nil)
 	c.Assert(err, IsNil)
 	txn, err := ctx.Txn(true)
 	c.Assert(err, IsNil)
@@ -2282,7 +2304,7 @@ func (s *testSuite4) TestNotNullDefault(c *C) {
 }
 
 func (s *testBypassSuite) TestLatch(c *C) {
-	store, err := mockstore.NewMockTikvStore(
+	store, err := mockstore.NewMockStore(
 		// Small latch slot size to make conflicts.
 		mockstore.WithTxnLocalLatches(64),
 	)
@@ -2551,7 +2573,7 @@ func (s *testSuite7) TestReplaceLog(c *C) {
 
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
-	_, err = indexOpr.Create(s.ctx, txn, types.MakeDatums(1), 1)
+	_, err = indexOpr.Create(s.ctx, txn, types.MakeDatums(1), kv.IntHandle(1))
 	c.Assert(err, IsNil)
 	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
@@ -2599,6 +2621,56 @@ func (s *testSuite7) TestRebaseIfNeeded(c *C) {
 	tk.MustQuery(`select a from t where b = 6;`).Check(testkit.Rows("30003"))
 }
 
+func (s *testSuite7) TestDeferConstraintCheckForDelete(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("set tidb_constraint_check_in_place = 0")
+	tk.MustExec("set @@tidb_txn_mode = 'optimistic'")
+	tk.MustExec("use test")
+
+	tk.MustExec("drop table if exists t1, t2, t3, t4, t5")
+	tk.MustExec("create table t1(i int primary key, j int)")
+	tk.MustExec("insert into t1 values(1, 2)")
+	tk.MustExec("begin")
+	tk.MustExec("insert into t1 values(1, 3)")
+	tk.MustExec("delete from t1 where j = 3")
+	_, err := tk.Exec("commit")
+	c.Assert(err.Error(), Equals, "previous statement: delete from t1 where j = 3: [kv:1062]Duplicate entry '1' for key 'PRIMARY'")
+	tk.MustExec("rollback")
+
+	tk.MustExec("create table t2(i int, j int, unique index idx(i))")
+	tk.MustExec("insert into t2 values(1, 2)")
+	tk.MustExec("begin")
+	tk.MustExec("insert into t2 values(1, 3)")
+	tk.MustExec("delete from t2 where j = 3")
+	_, err = tk.Exec("commit")
+	c.Assert(err.Error(), Equals, "previous statement: delete from t2 where j = 3: [kv:1062]Duplicate entry '1' for key 'idx'")
+	tk.MustExec("admin check table t2")
+
+	tk.MustExec("create table t3(i int, j int, primary key(i))")
+	tk.MustExec("begin")
+	tk.MustExec("insert into t3 values(1, 3)")
+	tk.MustExec("delete from t3 where j = 3")
+	tk.MustExec("commit")
+
+	tk.MustExec("create table t4(i int, j int, primary key(i))")
+	tk.MustExec("begin")
+	tk.MustExec("insert into t4 values(1, 3)")
+	tk.MustExec("delete from t4 where j = 3")
+	tk.MustExec("insert into t4 values(2, 3)")
+	tk.MustExec("commit")
+	tk.MustExec("admin check table t4")
+	tk.MustQuery("select * from t4").Check(testkit.Rows("2 3"))
+
+	tk.MustExec("create table t5(i int, j int, primary key(i))")
+	tk.MustExec("begin")
+	tk.MustExec("insert into t5 values(1, 3)")
+	tk.MustExec("delete from t5 where j = 3")
+	tk.MustExec("insert into t5 values(1, 4)")
+	tk.MustExec("commit")
+	tk.MustExec("admin check table t5")
+	tk.MustQuery("select * from t5").Check(testkit.Rows("1 4"))
+}
+
 func (s *testSuite7) TestDeferConstraintCheckForInsert(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec(`use test`)
@@ -2643,6 +2715,32 @@ func (s *testSuite7) TestDeferConstraintCheckForInsert(c *C) {
 	tk.MustExec("insert into t values (1, 3)")
 	_, err = tk.Exec("commit")
 	c.Assert(err, NotNil)
+}
+
+func (s *testSuite7) TestPessimisticDeleteYourWrites(c *C) {
+	session1 := testkit.NewTestKitWithInit(c, s.store)
+	session2 := testkit.NewTestKitWithInit(c, s.store)
+
+	session1.MustExec("drop table if exists x;")
+	session1.MustExec("create table x (id int primary key, c int);")
+
+	session1.MustExec("set tidb_txn_mode = 'pessimistic'")
+	session2.MustExec("set tidb_txn_mode = 'pessimistic'")
+
+	session1.MustExec("begin;")
+	session1.MustExec("insert into x select 1, 1")
+	session1.MustExec("delete from x where id = 1")
+	session2.MustExec("begin;")
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		session2.MustExec("insert into x select 1, 2")
+		wg.Done()
+	}()
+	session1.MustExec("commit;")
+	wg.Wait()
+	session2.MustExec("commit;")
+	session2.MustQuery("select * from x").Check(testkit.Rows("1 2"))
 }
 
 func (s *testSuite7) TestDefEnumInsert(c *C) {

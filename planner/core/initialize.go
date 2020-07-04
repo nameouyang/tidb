@@ -35,20 +35,26 @@ func (p LogicalJoin) Init(ctx sessionctx.Context, offset int) *LogicalJoin {
 
 // Init initializes DataSource.
 func (ds DataSource) Init(ctx sessionctx.Context, offset int) *DataSource {
-	ds.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypeTableScan, &ds, offset)
+	ds.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypeDataSource, &ds, offset)
 	return &ds
 }
 
-// Init initializes TableGather.
-func (tg TableGather) Init(ctx sessionctx.Context, offset int) *TableGather {
-	tg.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypeTableGather, &tg, offset)
-	return &tg
+// Init initializes TiKVSingleGather.
+func (sg TiKVSingleGather) Init(ctx sessionctx.Context, offset int) *TiKVSingleGather {
+	sg.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypeTiKVSingleGather, &sg, offset)
+	return &sg
 }
 
-// Init initializes TableScan.
-func (ts TableScan) Init(ctx sessionctx.Context, offset int) *TableScan {
+// Init initializes LogicalTableScan.
+func (ts LogicalTableScan) Init(ctx sessionctx.Context, offset int) *LogicalTableScan {
 	ts.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypeTableScan, &ts, offset)
 	return &ts
+}
+
+// Init initializes LogicalIndexScan.
+func (is LogicalIndexScan) Init(ctx sessionctx.Context, offset int) *LogicalIndexScan {
+	is.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypeIdxScan, &is, offset)
+	return &is
 }
 
 // Init initializes LogicalApply.
@@ -97,6 +103,12 @@ func (p LogicalUnionAll) Init(ctx sessionctx.Context, offset int) *LogicalUnionA
 	return &p
 }
 
+// Init initializes LogicalPartitionUnionAll.
+func (p LogicalPartitionUnionAll) Init(ctx sessionctx.Context, offset int) *LogicalPartitionUnionAll {
+	p.baseLogicalPlan = newBaseLogicalPlan(ctx, plancodec.TypePartitionUnion, &p, offset)
+	return &p
+}
+
 // Init initializes PhysicalUnionAll.
 func (p PhysicalUnionAll) Init(ctx sessionctx.Context, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalUnionAll {
 	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeUnion, &p, offset)
@@ -120,9 +132,10 @@ func (p PhysicalSort) Init(ctx sessionctx.Context, stats *property.StatsInfo, of
 }
 
 // Init initializes NominalSort.
-func (p NominalSort) Init(ctx sessionctx.Context, offset int, props ...*property.PhysicalProperty) *NominalSort {
+func (p NominalSort) Init(ctx sessionctx.Context, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *NominalSort {
 	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeSort, &p, offset)
 	p.childrenReqProps = props
+	p.stats = stats
 	return &p
 }
 
@@ -190,6 +203,22 @@ func (p LogicalWindow) Init(ctx sessionctx.Context, offset int) *LogicalWindow {
 // Init initializes PhysicalWindow.
 func (p PhysicalWindow) Init(ctx sessionctx.Context, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalWindow {
 	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeWindow, &p, offset)
+	p.childrenReqProps = props
+	p.stats = stats
+	return &p
+}
+
+// Init initializes PhysicalShuffle.
+func (p PhysicalShuffle) Init(ctx sessionctx.Context, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalShuffle {
+	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeShuffle, &p, offset)
+	p.childrenReqProps = props
+	p.stats = stats
+	return &p
+}
+
+// Init initializes PhysicalShuffleDataSourceStub.
+func (p PhysicalShuffleDataSourceStub) Init(ctx sessionctx.Context, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalShuffleDataSourceStub {
+	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeShuffleDataSourceStub, &p, offset)
 	p.childrenReqProps = props
 	p.stats = stats
 	return &p
@@ -282,10 +311,7 @@ func (p PhysicalMemTable) Init(ctx sessionctx.Context, stats *property.StatsInfo
 
 // Init initializes PhysicalHashJoin.
 func (p PhysicalHashJoin) Init(ctx sessionctx.Context, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalHashJoin {
-	tp := plancodec.TypeHashRightJoin
-	if p.InnerChildIdx == 1 {
-		tp = plancodec.TypeHashLeftJoin
-	}
+	tp := plancodec.TypeHashJoin
 	p.basePhysicalPlan = newBasePhysicalPlan(ctx, tp, &p, offset)
 	p.childrenReqProps = props
 	p.stats = stats
@@ -357,8 +383,8 @@ func (p PhysicalIndexMergeReader) Init(ctx sessionctx.Context, offset int) *Phys
 		for _, partPlan := range p.partialPlans {
 			totalRowCount += partPlan.StatsCount()
 		}
-		p.stats.StatsVersion = p.partialPlans[0].statsInfo().StatsVersion
 		p.stats = p.partialPlans[0].statsInfo().ScaleByExpectCnt(totalRowCount)
+		p.stats.StatsVersion = p.partialPlans[0].statsInfo().StatsVersion
 	}
 	p.PartialPlans = make([][]PhysicalPlan, 0, len(p.partialPlans))
 	for _, partialPlan := range p.partialPlans {
@@ -393,15 +419,7 @@ func (p PhysicalTableReader) Init(ctx sessionctx.Context, offset int) *PhysicalT
 // Init initializes PhysicalIndexReader.
 func (p PhysicalIndexReader) Init(ctx sessionctx.Context, offset int) *PhysicalIndexReader {
 	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeIndexReader, &p, offset)
-	p.IndexPlans = flattenPushDownPlan(p.indexPlan)
-	switch p.indexPlan.(type) {
-	case *PhysicalHashAgg, *PhysicalStreamAgg:
-		p.schema = p.indexPlan.Schema()
-	default:
-		is := p.IndexPlans[0].(*PhysicalIndexScan)
-		p.schema = is.dataSourceSchema
-	}
-	p.OutputColumns = p.schema.Clone().Columns
+	p.SetSchema(nil)
 	return &p
 }
 
@@ -432,11 +450,12 @@ func (p PhysicalIndexHashJoin) Init(ctx sessionctx.Context) *PhysicalIndexHashJo
 }
 
 // Init initializes BatchPointGetPlan.
-func (p BatchPointGetPlan) Init(ctx sessionctx.Context, stats *property.StatsInfo, schema *expression.Schema, names []*types.FieldName) *BatchPointGetPlan {
-	p.basePlan = newBasePlan(ctx, plancodec.TypeBatchPointGet, 0)
+func (p BatchPointGetPlan) Init(ctx sessionctx.Context, stats *property.StatsInfo, schema *expression.Schema, names []*types.FieldName, offset int) *BatchPointGetPlan {
+	p.basePlan = newBasePlan(ctx, plancodec.TypeBatchPointGet, offset)
 	p.schema = schema
 	p.names = names
 	p.stats = stats
+	p.Columns = ExpandVirtualColumn(p.Columns, p.schema, p.TblInfo.Columns)
 	return &p
 }
 
